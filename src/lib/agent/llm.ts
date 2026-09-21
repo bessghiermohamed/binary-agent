@@ -204,10 +204,10 @@ function modelOf(name: string): string {
 async function callOne(
   name: string,
   messages: ChatMsg[],
-  opts: { temperature?: number; maxTokens?: number },
+  opts: { temperature?: number; maxTokens?: number; model?: string },
 ): Promise<{ provider: string; text: string; ms: number }> {
   const p = PROVIDERS[name];
-  const model = modelOf(name);
+  const model = opts.model || modelOf(name);
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (p.keyEnv && process.env[p.keyEnv]) headers.authorization = `Bearer ${process.env[p.keyEnv]}`;
   if (p.extraHeaders) Object.assign(headers, p.extraHeaders);
@@ -347,15 +347,18 @@ export async function chatJson(
 }
 
 // ─── provider probe (setup/verification, burns no budget silently) ─────────
-export async function probeProvider(name: string): Promise<{ ok: boolean; ms: number; error: string }> {
-  if (!usable(name)) return { ok: false, ms: 0, error: 'not usable (missing key or url)' };
+export async function probeProvider(
+  name: string,
+  modelOverride?: string,
+): Promise<{ ok: boolean; ms: number; error: string; model?: string }> {
+  if (!usable(name) && !modelOverride) return { ok: false, ms: 0, error: 'not usable (missing key or url)' };
   try {
     const r = await callOne(name, [
       { role: 'system', content: 'You are a probe. Reply with the single word: OK' },
       { role: 'user', content: 'ping' },
-    ], { temperature: 0, maxTokens: 48 }); // 48 — reasoning models burn budget on hidden thinking before "OK"
-    return { ok: true, ms: r.ms, error: '' };
+    ], { temperature: 0, maxTokens: 48, model: modelOverride }); // 48 — reasoning models burn budget on hidden thinking before "OK"
+    return { ok: true, ms: r.ms, error: '', model: modelOverride };
   } catch (e: any) {
-    return { ok: false, ms: 0, error: String(e?.message || e).slice(0, 120) };
+    return { ok: false, ms: 0, error: String(e?.message || e).slice(0, 120), model: modelOverride };
   }
 }

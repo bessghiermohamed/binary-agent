@@ -25,6 +25,23 @@ export async function GET(req: NextRequest) {
   // Burns one tiny call per usable provider; does not touch agent state,
   // budgets, or memory. This is the "supplier problem" observability that
   // was missing when model IDs silently retired (Sept 2026 audit).
+  // ?probe=llm&deep=gemini — one deploy, every candidate model tested: the
+  // answer to "which Gemini model actually responds TODAY from production".
+  const deep = req.nextUrl.searchParams.get('deep');
+  if (req.nextUrl.searchParams.get('probe') === 'llm' && deep === 'gemini') {
+    const { probeProvider } = await import('@/lib/agent/llm');
+    const candidates = [
+      'gemini-flash-lite-latest', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite',
+      'gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-flash-latest',
+      'gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-3.8-flash',
+    ];
+    const results = await Promise.all(candidates.map(async (m) => {
+      const r = await probeProvider('gemini', m);
+      return { model: m, ok: r.ok, ms: r.ms, error: r.error.slice(0, 90) };
+    }));
+    const winner = results.filter((r) => r.ok).sort((a, b) => a.ms - b.ms)[0] || null;
+    return NextResponse.json({ ok: true, probe: 'gemini-deep', at: new Date().toISOString(), results, fastestWorking: winner });
+  }
   if (req.nextUrl.searchParams.get('probe') === 'llm') {
     const { PROVIDERS, probeProvider, llmHealth } = await import('@/lib/agent/llm');
     const providers: Record<string, unknown> = {};
