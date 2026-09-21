@@ -1,10 +1,11 @@
-// ─── Binary's LLM cortex — 8-provider fallback chain ─────────────────────
+// ─── Binary's LLM cortex — 9-provider fallback chain ─────────────────────
 // Zero dependencies, OpenAI-compatible endpoints, provider order:
-// gemini > openrouter > mistral > huggingface > cohere > cloudflare > grok > groq.
-// Keys come from Vercel env (never hardcoded).
+// gemini > openrouter > mistral > huggingface > cohere > cloudflare > pollinations > grok > groq.
+// Keys come from Vercel env (never hardcoded). Pollinations is a keyless
+// community endpoint (GPT4Free-style) — an always-available safety net.
 // Verified 2026-09-21: openrouter (llama-3.3-70b) OK, mistral OK, huggingface OK,
-// cohere OK, cloudflare-ai OK; gemini valid but geo-gated (works from Vercel US);
-// groq 403 (region); grok key valid but out of credits.
+// cohere OK, cloudflare-ai OK, pollinations OK (Arabic); gemini valid but geo-gated
+// (works from Vercel US); groq 403 (region); grok key valid but out of credits.
 
 const PROVIDERS: Record<string, any> = {
   gemini: {
@@ -36,11 +37,17 @@ const PROVIDERS: Record<string, any> = {
     model: '@cf/meta/llama-3.1-8b-instruct',
     unwrap: 'result', // response shape: { success, result: { choices: [...] } }
   },
+  pollinations: {
+    // Keyless community endpoint (GPT4Free-style). No API key env needed.
+    url: 'https://text.pollinations.ai/openai',
+    keyEnv: '',
+    model: 'openai-fast',
+  },
   grok: { url: 'https://api.x.ai/v1/chat/completions', keyEnv: 'GROK_API_KEY', model: 'grok-3-mini' },
   groq: { url: 'https://api.groq.com/openai/v1/chat/completions', keyEnv: 'GROQ_API_KEY', model: 'llama-3.3-70b-versatile' },
 };
 
-const CHAIN = ['gemini', 'openrouter', 'mistral', 'huggingface', 'cohere', 'cloudflare', 'grok', 'groq'];
+const CHAIN = ['gemini', 'openrouter', 'mistral', 'huggingface', 'cohere', 'cloudflare', 'pollinations', 'grok', 'groq'];
 
 export const llmStats = { ok: 0, fail: 0, lastError: '', lastProvider: '' };
 
@@ -50,7 +57,7 @@ function modelFor(name: string): string {
 
 async function callOne(name: string, messages: any[], opts: { maxTokens: number; temperature: number }): Promise<string> {
   const cfg = PROVIDERS[name];
-  const key = process.env[cfg.keyEnv];
+  const key = cfg.keyEnv ? process.env[cfg.keyEnv] : 'keyless';
   if (!key) throw new Error('missing API key env: ' + cfg.keyEnv);
   if (!cfg.url) throw new Error('missing config for provider: ' + name);
   const ctrl = new AbortController();
@@ -58,7 +65,11 @@ async function callOne(name: string, messages: any[], opts: { maxTokens: number;
   try {
     const res = await fetch(cfg.url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}`, ...(cfg.extraHeaders || {}) },
+      headers: {
+        'content-type': 'application/json',
+        ...(cfg.keyEnv ? { authorization: `Bearer ${key}` } : {}),
+        ...(cfg.extraHeaders || {}),
+      },
       body: JSON.stringify({ model: modelFor(name), messages, max_tokens: opts.maxTokens, temperature: opts.temperature }),
       signal: ctrl.signal,
     });

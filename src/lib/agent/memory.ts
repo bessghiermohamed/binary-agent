@@ -136,6 +136,171 @@ async function sbMirror(path: string, content: string): Promise<void> {
   }
 }
 
+// ─── Supabase DB (pgvector semantic memory) + Cloudflare bge-m3 embeddings ────
+// The dedicated Supabase agent project stores three queryable tables:
+//   agent_episodes — every experience line (with embedding for semantic recall)
+//   agent_insights — durable lessons (with embedding)
+//   agent_messages — conversation log per chat (with embedding)
+// Mirroring is best-effort: 3 consecutive failures disable it for 30 minutes,
+// exactly like the Storage mirror. Reads power recallMemories() for the chat path.
+
+const SB_EMBED_MODEL = '@cf/baai/bge-m3'; // 1024-dim multilingual (Arabic-capable), free tier
+
+let sbDbFailures = 0;
+let sbDbDisabledUntil = 0;
+export function sbDbStatus() {
+  return {
+    enabled: Date.now() > sbDbDisabledUntil && !!process.env.SUPABASE_URL && !!process.env.SUPABASE_SERVICE_KEY,
+    failures: sbDbFailures,
+  };
+}
+
+function sbDbNoteFail(e: any) {
+  sbDbFailures++;
+  if (sbDbFailures >= 3) {
+    sbDbDisabledUntil = Date.now() + 30 * 60_000;
+    console.error('[agent.memory] supabase DB disabled for 30min:', String(e?.message || e).slice(0, 100));
+  }
+}
+
+async function sbRest(path: string, init: any, timeoutMs = 5000): Promise<any> {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) throw new Error('supabase env missing');
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${url}/rest/v1/${path}`, {
+      ...init,
+      headers: {
+        authorization: `Bearer ${key}`,
+        apikey: key,
+        'content-type': 'application/json',
+        prefer: 'return=minimal',
+        ...(init?.headers || {}),
+      },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`sbRest ${res.status}: ${(await res.text()).slice(0, 120)}`);
+    return res.status === 204 ? null : res.json().catch(() => null);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/** Embed text via Cloudflare Workers AI bge-m3 (1024 dims, multilingual). Free. */
+export async function embedText(text: string): Promise<number[] | null> {
+  const acc = process.env.CF_ACCOUNT_ID;
+  const tok = process.env.CF_API_TOKEN;
+  if (!acc || !tok) return null;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 6000);
+  try {
+    const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc}/ai/run/${SB_EMBED_MODEL}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ text: [String(text).slice(0, 2000)] }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`embed HTTP ${res.status}`);
+    const j: any = await res.json();
+    const v = j?.result?.data?.[0];
+    return Array.isArray(v) && v.length === 1024 ? v : null;
+  } catch (e: any) {
+    console.error('[agent.memory] embed failed:', e?.message?.slice(0, 80));
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/** Fire-and-forget mirror of one memory line into the Supabase agent DB. */
+async function sbDbMirror(path: string, entry: any): Promise<void> {
+  if (Date.now() < sbDbDisabledUntil) return;
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) return;
+  try {
+    if (path === 'episodic.jsonl') {
+      const e = entry || {};
+      const emb = await embedText(e.text || '');
+      await sbRest('agent_episodes', {
+        method: 'POST',
+        body: JSON.stringify({
+          ts: new Date(e.ts || Date.now()).toISOString(),
+          text: String(e.text || '').slice(0, 1000),
+          goal_id: e.goalId ? String(e.goalId) : null,
+          tool: e.tool ? String(e.tool) : null,
+          ok: typeof e.ok === 'boolean' ? e.ok : null,
+          embedding: emb,
+          detail: e,
+        }),
+      });
+    } else if (path === 'insights.jsonl') {
+      const emb = await embedText(entry?.text || '');
+      await sbRest('agent_insights', {
+        method: 'POST',
+        body: JSON.stringify({
+          ts: new Date(entry?.ts || Date.now()).toISOString(),
+          text: String(entry?.text || '').slice(0, 1000),
+          embedding: emb,
+        }),
+      });
+    } else if (path.startsWith('conversations/')) {
+      const chatId = decodeURIComponent(path.slice('conversations/'.length)).replace(/\.jsonl$/, '');
+      const emb = await embedText(`${entry?.who || ''}: ${entry?.text || ''}`);
+      await sbRest('agent_messages', {
+        method: 'POST',
+        body: JSON.stringify({
+          chat_id: chatId,
+          ts: new Date(entry?.ts || Date.now()).toISOString(),
+          who: String(entry?.who || '').slice(0, 80),
+          text: String(entry?.text || '').slice(0, 1000),
+          embedding: emb,
+        }),
+      });
+    } else return;
+    sbDbFailures = 0;
+  } catch (e: any) {
+    sbDbNoteFail(e);
+  }
+}
+
+/**
+ * Semantic recall for the chat path: embed the message, then pgvector cosine
+ * search over conversation history + insights. Best-effort — empty string on
+ * any failure (the chat never blocks on this).
+ */
+export async function recallMemories(query: string, chatId: string | null): Promise<string> {
+  if (Date.now() < sbDbDisabledUntil) return '';
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) return '';
+  try {
+    const emb = await embedText(query);
+    if (!emb) return '';
+    const [msgs, ins] = await Promise.all([
+      sbRest(
+        'rpc/match_agent_messages',
+        { method: 'POST', body: JSON.stringify({ query_embedding: emb, match_count: 4, filter_chat: chatId }) },
+        8000
+      ),
+      sbRest(
+        'rpc/match_agent_insights',
+        { method: 'POST', body: JSON.stringify({ query_embedding: emb, match_count: 3 }) },
+        8000
+      ),
+    ]);
+    const lines: string[] = [];
+    for (const m of Array.isArray(msgs) ? msgs : []) {
+      if (m?.text) lines.push(`- ${(m.who || '?')}: ${String(m.text).slice(0, 180)}`);
+    }
+    for (const i of Array.isArray(ins) ? ins : []) {
+      if (i?.text) lines.push(`- درس سابق: ${String(i.text).slice(0, 180)}`);
+    }
+    return lines.slice(0, 7).join('\n');
+  } catch (e: any) {
+    console.error('[agent.memory] recall failed:', String(e?.message || e).slice(0, 100));
+    return '';
+  }
+}
+
 async function readJson<T>(path: string, fallback: T): Promise<{ data: T; sha: string | null }> {
   try {
     const f: RawFile = await readFile(T(), R(), path);
@@ -190,6 +355,7 @@ export async function appendLine(
       `memory: ${path} +1`,
       { sha: f.sha }
     );
+    if (r.ok) void sbDbMirror(path, entry).catch(() => {}); // semantic mirror (best-effort)
     return r.ok ? { ok: true } : { ok: false, error: r.error };
   } catch (e: any) {
     return { ok: false, error: e?.message };
