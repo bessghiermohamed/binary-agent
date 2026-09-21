@@ -50,7 +50,7 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     keyEnv: 'GEMINI_API_KEY',
     model: 'gemini-flash-latest',
     wave: 1,
-    note: 'rolling alias; if it 404s set MODEL_GEMINI=gemini-3.6-flash (2.0 retired Sept 2026; key rotated by owner)',
+    note: 'MODEL_GEMINI env pins gemini-3.5-flash-lite (590ms, verified by deep-probe Sept 2026; 2.5-gen retired, thinking models 503-overloaded). When this rots: ?probe=llm&deep=gemini finds the next live model.',
   },
   openrouter: {
     url: 'https://openrouter.ai/api/v1/chat/completions',
