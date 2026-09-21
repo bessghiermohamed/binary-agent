@@ -353,7 +353,7 @@ export async function probeProvider(name: string): Promise<{ ok: boolean; ms: nu
     const r = await callOne(name, [
       { role: 'system', content: 'You are a probe. Reply with the single word: OK' },
       { role: 'user', content: 'ping' },
-    ], { temperature: 0, maxTokens: 8 });
+    ], { temperature: 0, maxTokens: 48 }); // 48 — reasoning models burn budget on hidden thinking before "OK"
     return { ok: true, ms: r.ms, error: '' };
   } catch (e: any) {
     return { ok: false, ms: 0, error: String(e?.message || e).slice(0, 120) };
