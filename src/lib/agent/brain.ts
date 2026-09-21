@@ -20,7 +20,7 @@ import {
   AgentState, Approval, Memory, appendConversation, appendEpisode, appendInsight,
   loadMemory, readConversation, recallMemories, saveApprovals, saveGoals, saveIdentity, saveState,
 } from './memory';
-import { TOOL_MAP, TOOLS, execTool, dispatchTick, type ToolResult } from './tools';
+import { TOOL_MAP, TOOLS, execTool, dispatchTick, webSearch, type ToolResult } from './tools';
 import { answerCallback, sendTelegram, sendTyping } from './telegram';
 
 const LOCK_TTL_MS = 120_000;
@@ -44,6 +44,7 @@ function hardRulesPrompt(): string {
     '4) إن فشل أداة مرتين غيّر الأسلوب؛ وإن أخفقت تمامًا فاعترف بالفشل بوضوح.',
     '5) كن مقتصدًا في نداء الأدوات؛ نداك واحد فقط لكل نبضة.',
     '6) لا تطلب هدفًا جديدًا إن وُجد هدف نشط مطابق — حدّث القائم.',
+    '7) لا تُجدول مهمة لتعديل مهمة مجدولة ولا هدفًا لإدارة تذكير — نفّذ العمل مباشرة.',
   ].join('\n');
 }
 
@@ -442,6 +443,25 @@ export async function handleChatMessage(chatId: string, fromName: string, text: 
 
   // free-form chat — with semantic recall, the local clock, and the
   // anti-goal-filing rule (v3 fix).
+  // v4: question-shaped or current-events-shaped messages get a bounded live
+  // web pass first, so chat answers carry fresh facts instead of stale model
+  // priors (the "agent knows nothing but the time" complaint, Sept 2026).
+  const t0 = Date.now();
+  const needsFresh =
+    /[؟?]/.test(text) ||
+    /أخبار|اخبار|اليوم|الآن|حالي|آخر|اخير|سعر|طقس|مباراة|نتائج|من هو|ما هو|متى|أين|كم/i.test(text);
+  let freshBlock = '';
+  if (needsFresh) {
+    const hits = await Promise.race([
+      webSearch(text.slice(0, 200)),
+      new Promise<{ title: string; url: string; snippet: string }[]>((resolve) =>
+        setTimeout(() => resolve([]), 14_000)),
+    ]).catch(() => [] as { title: string; url: string; snippet: string }[]);
+    if (hits.length) {
+      freshBlock = 'نتائج بحث ويب حديثة عن رسالة المالك (استند إليها عند الإجابة واذكر المصدر عند النقل):\n'
+        + hits.slice(0, 5).map((h) => `• ${h.title}${h.snippet ? ` — ${h.snippet.slice(0, 160)}` : ''} (${h.url})`).join('\n');
+    }
+  }
   const [recalled, history] = await Promise.all([
     recallMemories(text).catch(() => [] as string[]),
     readConversation(chatId).catch(() => [] as { who: string; text: string }[]),
@@ -453,13 +473,15 @@ export async function handleChatMessage(chatId: string, fromName: string, text: 
         identityPrompt(m),
         hardRulesPrompt(),
         'أنت الآن في محادثة مباشرة مع مالكك عبر تلغرام. أجب إجابة نهائية مفيدة من معلوماتك وما يلي — لا تخطط ولا تسجّل أهدافًا من الدردشة العادية. إن كان السؤال يتطلب عملًا لاحقًا فأخبره فقط أنك ستتولاه في نبضتك القادمة.',
+        freshBlock,
         recalled.length ? `ذكريات ذات صلة:\n${recalled.join('\n')}` : '',
         history.length ? `سياق المحادثة الأخيرة:\n${history.slice(-10).map((h) => `${h.who === 'owner' ? 'المالك' : 'أنا'}: ${h.text.slice(0, 150)}`).join('\n')}` : '',
       ].filter(Boolean).join('\n\n'),
     },
     { role: 'user', content: text.slice(0, 3000) },
   ];
-  const r = await chat(msgs, { temperature: 0.6, maxTokens: TOKEN_CEIL.chat, budgetMs: BUDGETS.workBudgetMs - 6000 });
+  const chatBudget = Math.max(18_000, BUDGETS.workBudgetMs - 6000 - (Date.now() - t0));
+  const r = await chat(msgs, { temperature: 0.6, maxTokens: TOKEN_CEIL.chat, budgetMs: chatBudget });
   const reply = (r?.text || 'اعتذر — تعذّر وصولي إلى مزودات الذكاء الآن. سأحاول بعد قليل.').slice(0, 3900);
   await sendTelegram(chatId, reply);
   await appendConversation(chatId, 'agent', reply);

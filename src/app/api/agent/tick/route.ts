@@ -21,6 +21,24 @@ export async function GET(req: NextRequest) {
   if (!authorized(req)) {
     return NextResponse.json({ ok: false, error: 'bad-secret' }, { status: 401 });
   }
+  // ?probe=llm — one-shot provider health audit from production (v4).
+  // Burns one tiny call per usable provider; does not touch agent state,
+  // budgets, or memory. This is the "supplier problem" observability that
+  // was missing when model IDs silently retired (Sept 2026 audit).
+  if (req.nextUrl.searchParams.get('probe') === 'llm') {
+    const { PROVIDERS, probeProvider, llmHealth } = await import('@/lib/agent/llm');
+    const providers: Record<string, unknown> = {};
+    await Promise.all(Object.keys(PROVIDERS).map(async (name) => {
+      providers[name] = await probeProvider(name);
+    }));
+    return NextResponse.json({
+      ok: true,
+      probe: 'llm',
+      at: new Date().toISOString(),
+      providers,
+      health: llmHealth(),
+    });
+  }
   const result = await runTick('manual');
   return NextResponse.json({ ok: true, ...result });
 }

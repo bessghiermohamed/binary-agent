@@ -8,10 +8,18 @@
 //  · add_goal / update_goal — goal hygiene: no junk titles, no duplicates,
 //    update_goal errors carry the live goal list so the LLM self-corrects.
 //  · web_search — 7-backend fail-fast chain, tuned for Arabic queries.
+//
+// v4 fixes (Sept 2026 audit):
+//  · web_search — 8th backend (Bing News RSS) + exported for the chat path,
+//    so direct Telegram questions can carry fresh facts too.
+//  · schedule_task — anti-obsession guard: refuses meta-reminders (a reminder
+//    about a reminder) and refuses a 3rd pending task on the same topic. The
+//    v3 agent burned 191/220 daily LLM calls scheduling "adjust the 7:46
+//    reminder" reminders — this guard starves that loop at the tool level.
 
 import { runInNewContext } from 'node:vm';
 import { dzWallClockToEpoch, epochToWall, nextId } from './config';
-import { Goal, Memory, appendInsight, saveGoals, findActiveGoalByTitle, isJunkTitle } from './memory';
+import { Goal, Memory, appendInsight, saveGoals, findActiveGoalByTitle, isJunkTitle, normTitle } from './memory';
 import { sendApprovalButtons, sendTelegram } from './telegram';
 import { dispatchWorkflow, writeFile } from './github';
 import { REPOS, SECRETS } from './config';
@@ -91,8 +99,8 @@ function ssrfGuard(url: string): string | null {
   }
 }
 
-// ─── web_search: 7-backend fail-fast chain ──────────────────────────────────
-interface Hit { title: string; url: string; snippet: string }
+// ─── web_search: 8-backend fail-fast chain ───────────────────────────────────
+export interface Hit { title: string; url: string; snippet: string }
 
 async function searchWikipedia(query: string): Promise<Hit[]> {
   try {
@@ -194,6 +202,21 @@ async function searchBingViaJina(query: string): Promise<Hit[]> {
   } catch { return []; }
 }
 
+async function searchBingNewsRss(query: string): Promise<Hit[]> {
+  try {
+    // second news RSS — different index than Google News, Arabic/DZ market
+    const r = await fetchT(`https://www.bing.com/news/search?q=${encodeURIComponent(query)}&format=rss&mkt=ar-DZ`, {}, 10_000);
+    const xml = await r.text();
+    const hits: Hit[] = [];
+    const re = /<item><title>([\s\S]*?)<\/title><link>([\s\S]*?)<\/link>(?:<description>([\s\S]*?)<\/description>)?/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(xml)) && hits.length < 6) {
+      hits.push({ title: stripHtml(m[1]).slice(0, 140), url: m[2].trim(), snippet: m[3] ? stripHtml(m[3]).slice(0, 220) : '' });
+    }
+    return hits;
+  } catch { return []; }
+}
+
 async function searchMojeek(query: string): Promise<Hit[]> {
   try {
     const r = await fetchT(`https://www.mojeek.com/search?q=${encodeURIComponent(query)}`, {}, 10_000);
@@ -208,7 +231,7 @@ async function searchMojeek(query: string): Promise<Hit[]> {
   } catch { return []; }
 }
 
-async function webSearch(query: string): Promise<Hit[]> {
+export async function webSearch(query: string): Promise<Hit[]> {
   const isArabic = /[\u0600-\u06FF]/.test(query);
   const backends = [
     ...(isArabic ? [searchWikipedia] : []),
@@ -216,6 +239,7 @@ async function webSearch(query: string): Promise<Hit[]> {
     searchDdgHtml,
     searchDdgLite,
     searchGoogleNewsDz,
+    searchBingNewsRss,
     searchBingViaJina,
     searchMojeek,
   ];
@@ -425,6 +449,26 @@ export async function execTool(m: Memory, tool: string, rawArgs: Record<string, 
         // duplicate suppression — same normalized what within 2-minute window
         const dup = m.state.scheduled.find((t) => Math.abs(t.dueAt - dueAt) < 120_000 && t.what.trim() === what);
         if (dup) return { ok: true, summary: `المهمة مجدولة أصلًا (${dup.id} عند ${epochToWall(dup.dueAt)})` };
+        // v4 anti-obsession guards (Sept 2026 audit):
+        // 1) never schedule a task whose purpose is managing another task —
+        //    that is the exact shape of the 07:46 reminder loop.
+        if (/تعديل\s*تذكير|ضبط\s*تذكير|تذكير[^.]{0,24}تذكير|تنبيه[^.]{0,24}تنبيه|متابعة\s*التذكير/.test(what)) {
+          return { ok: false, summary: 'schedule_task: لا تُجدول مهمة لإدارة مهمة مجدولة — نفّذ التعديل فورًا أو انتظر موعدها' };
+        }
+        // 2) refuse a 3rd pending task on the same topic (word-overlap twin).
+        const topicTwin = (a: string, b: string): boolean => {
+          const na = normTitle(a), nb = normTitle(b);
+          if (!na || !nb) return false;
+          if (na.includes(nb) || nb.includes(na)) return true;
+          const wa = new Set(na.split(/\s+/).filter((w) => w.length > 3));
+          const wb = nb.split(/\s+/).filter((w) => w.length > 3);
+          const shared = [...wa].filter((w) => wb.includes(w)).length;
+          return wa.size > 0 && wb.length > 0 && shared / Math.min(wa.size, wb.length) >= 0.5;
+        };
+        const sameTopic = m.state.scheduled.filter((t) => topicTwin(t.what, what));
+        if (sameTopic.length >= 2) {
+          return { ok: false, summary: `schedule_task: أتابع هذا الموضوع بمهامّ مجدولة أصلًا (${sameTopic.map((t) => t.id).join('، ')}) — لن أضيف تتبعًا ثالثًا له` };
+        }
         const task = { id: nextId('t'), what, dueAt, createdAt: Date.now(), goalId: m.state.currentTask?.goalId };
         m.state.scheduled.push(task);
         return { ok: true, summary: `جُدولت "${what}" عند ${epochToWall(dueAt)} بتوقيت الجزائر (${task.id})` };

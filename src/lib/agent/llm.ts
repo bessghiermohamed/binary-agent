@@ -4,8 +4,8 @@
 // acceptable answer wins; a wave loses only when every member fails.
 //
 //   wave 1 (strong):   gemini · openrouter · cohere
-//   wave 2 (backup):   mistral · cloudflare · pollinations(openai)
-//   wave 3 (wide net): pollinations-mistral (keyless) · grok · groq · huggingface
+//   wave 2 (backup):   mistral · cloudflare(70b) · pollinations(openai-fast)
+//   wave 3 (wide net): huggingface-qwen(72b) · grok · groq · huggingface
 //
 // v3 hardening (why the previous build answered poorly):
 //  · 11 racers instead of 9 — a second keyless pollinations model widens the
@@ -16,6 +16,16 @@
 //    strictRetry at temperature ≤ 0.3 → {reply: raw} wrap. A parse miss can
 //    never masquerade as an outage (RULE 02).
 //  · overall budget enforced with a deadline that survives wave fan-out.
+//
+// v4 refresh (Sept 2026 audit — the "suppliers are broken" relapse):
+//  · model IDs rot in months: gemini-2.0-flash was retired outright, and
+//    pollinations dropped its 'openai'/'mistral' keyless models (only
+//    'openai-fast' remains) — so the keyless safety net had been racing on
+//    dead names. Every model below is probe-verified alive as of this audit;
+//    GET /api/agent/tick?key=...&probe=llm re-verifies the whole pool from
+//    production in one call.
+//  · cloudflare upgraded 8b → 70b fp8-fast; a second HF racer (Qwen 72B)
+//    replaces the retired keyless pollinations-mistral.
 //
 // Keys are env-only (RULE 11). Pollinations is keyless. Dormant providers
 // (grok: credits, groq: region, huggingface: CF block) stay in the chain —
@@ -40,7 +50,7 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     keyEnv: 'GEMINI_API_KEY',
     model: 'gemini-flash-latest',
     wave: 1,
-    note: 'geo-gated from some regions; healthy from Vercel US',
+    note: 'rolling alias; if it 404s set MODEL_GEMINI=gemini-3.6-flash (2.0 retired Sept 2026; key rotated by owner)',
   },
   openrouter: {
     url: 'https://openrouter.ai/api/v1/chat/completions',
@@ -64,29 +74,28 @@ export const PROVIDERS: Record<string, ProviderDef> = {
   },
   cloudflare: {
     url: process.env.CF_ACCOUNT_ID
-      ? `https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/ai/run/@cf/meta/llama-3.1-8b-instruct`
+      ? `https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/ai/run/@cf/meta/llama-3.3-70b-instruct-fp8-fast`
       : '',
     keyEnv: 'CF_API_TOKEN',
-    model: '@cf/meta/llama-3.1-8b-instruct',
+    model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
     wave: 2,
     unwrap: 'result',
-    note: 'Workers AI — response needs unwrap:result (RULE 04)',
+    note: 'Workers AI — 70b fp8-fast upgrade (Sept 2026 audit; 8b answered too weakly)',
   },
   pollinations: {
     url: 'https://text.pollinations.ai/openai',
     keyEnv: '',
-    model: 'openai',
+    model: 'openai-fast',
     wave: 2,
     keyless: true,
-    note: "keyless GPT4Free-style net — 'openai' writes cleaner Arabic than 'openai-fast'",
+    note: "keyless GPT4Free-style net — pollinations retired 'openai'/'mistral' in 2026; openai-fast is the only keyless model left",
   },
-  'pollinations-mistral': {
-    url: 'https://text.pollinations.ai/openai',
-    keyEnv: '',
-    model: 'mistral',
+  'huggingface-qwen': {
+    url: 'https://router.huggingface.co/v1/chat/completions',
+    keyEnv: 'HF_API_KEY',
+    model: 'Qwen/Qwen2.5-72B-Instruct',
     wave: 3,
-    keyless: true,
-    note: 'second keyless racer on a different upstream model',
+    note: 'second HF racer on a different upstream (Qwen 72B) — replaces retired pollinations-mistral',
   },
   grok: {
     url: 'https://api.x.ai/v1/chat/completions',
@@ -114,7 +123,7 @@ export const PROVIDERS: Record<string, ProviderDef> = {
 const WAVES: string[][] = [
   ['gemini', 'openrouter', 'cohere'],
   ['mistral', 'cloudflare', 'pollinations'],
-  ['pollinations-mistral', 'grok', 'groq', 'huggingface'],
+  ['huggingface-qwen', 'grok', 'groq', 'huggingface'],
 ];
 
 export interface ChatMsg { role: 'system' | 'user' | 'assistant'; content: string }
@@ -209,7 +218,7 @@ async function callOne(
     temperature: opts.temperature ?? 0.6,
     max_tokens: opts.maxTokens ?? TOKEN_CEIL.chat,
   };
-  if (name === 'pollinations' || name === 'pollinations-mistral') {
+  if (name === 'pollinations') {
     body.private = true; // keep community-proxy traffic off public feeds
   }
 
