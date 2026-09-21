@@ -1,73 +1,90 @@
-# Binary Agent (بيناري) — ONE repo, fully independent
+# Binary Agent — بيناري
 
-A single, standalone, general-purpose **autonomous Telegram agent** speaking
-Modern Standard Arabic, based in Tiaret, Algeria. This repository is the whole
-agent: engine, heartbeat/scheduler, docs — nothing else required.
+An autonomous, general-purpose AI agent behind a single Telegram bot (**@PaymonB_bot**) that speaks Modern Standard Arabic. It pursues goals between messages, uses tools, keeps durable + semantic memory, reflects on its own experience, and loops continuously on a heartbeat without any human triggering it.
 
-**LIVE:** `@PaymonB_bot` → `https://binary-agent.vercel.app/api/agent/webhook`
-
-## Architecture (one repo)
+**One repo · env-only secrets · free stack end-to-end.**
 
 ```
-binary-agent/                      ← you are here (public)
-├── src/lib/agent/                 ← the mind: brain, LLM, memory, tools, telegram
-├── src/app/api/agent/
-│   ├── webhook/route.ts           ← Telegram updates (secret-guarded)
-│   ├── tick/route.ts              ← heartbeat endpoint (secret-guarded)
-│   └── setup-db/route.ts          ← one-click Supabase schema bootstrap
-└── .github/workflows/
-    └── agent-tick.yml             ← the heartbeat: every 5 min + self-dispatch chains
+Telegram door                      Heartbeat door
+POST /api/agent/webhook            POST /api/agent/tick
+x-telegram-bot-api-secret-token    x-agent-secret · cron */5 + chains
+                    ┌──────────────────────────┐
+                    │  Brain — one tick = one  │
+                    │  thought (locked, CAS)   │
+                    └──────────────────────────┘
+      LLM cortex              Memory                  Tool belt
+ 11 providers, 3 waves    GitHub mind files      12 tools, risk-gated
+ Promise.any racing       + Supabase pgvector     (Arabic approval cards)
 ```
 
-- **Hosting:** Vercel (own project, `binary-agent.vercel.app`) — auto-deploys on push.
-- **Memory:**
-  - Semantic memory: **Supabase Postgres + pgvector** (`bge-m3` embeddings via
-    Cloudflare Workers AI) — recall injected into chat.
-  - Durable mind files (identity/state/goals/approvals): GitHub Contents API on a
-    **private** data repo (`binary-agent-memory`) — kept private because it holds
-    real conversation data. It is data infrastructure, not part of the agent code.
-- **Secrets:** environment variables only (`.env.example` documents all of them).
-  Nothing is committed.
+## The LLM cortex (v3)
 
-## LLM cortex v2 — hedged provider racing
+Providers never walk sequentially — they **race in parallel waves**; the first acceptable answer wins. A circuit breaker parks any provider that fails twice in a row for 8 minutes.
 
-Providers no longer walk a sequential chain (a single hang ate the whole time
-budget and starved the rest — the old failure mode). Providers now **race in
-parallel waves**, first acceptable answer wins:
+| Wave | Providers | Notes |
+|------|-----------|-------|
+| 1 — strong | `gemini`, `openrouter`, `cohere` | gemini is geo-gated from some regions, healthy from Vercel US |
+| 2 — backup | `mistral`, `cloudflare`, `pollinations` | pollinations is keyless (GPT4Free-style safety net) |
+| 3 — wide net | `pollinations-mistral` (keyless), `grok`, `groq`, `huggingface` | dormant providers stay parked cheaply and revive with zero code changes |
 
-| Wave | Providers | Role |
-|------|-----------|------|
-| 1 | gemini → openrouter → cohere | strong, fast |
-| 2 | mistral → cloudflare → pollinations | backup (+ keyless safety net) |
-| 3 | grok → groq → huggingface | dormant (parked: no credits / 403) |
+Timing: 14 s per-provider hard cut (AbortController), 42 s overall budget, breaker threshold 2, park 8 min. Per-provider model overrides: `MODEL_<PROVIDER>` env. Health is surfaced in Telegram `/status` and the dashboard (`/?key=AGENT_TICK_SECRET`).
 
-- Circuit breaker: 2 consecutive failures park a provider for 8 minutes.
-- 14s per-provider timeout, 42s overall budget.
-- `/status` in Telegram shows live provider health (ready / parked / last error).
+## Memory
 
-## Heartbeat
+- **Layer 1 (canonical)**: plain files in the private [binary-agent-memory](https://github.com/bessghiermohamed/binary-agent-memory) repo via the GitHub Contents API with optimistic concurrency — `state.json` (whose sha doubles as the distributed tick lock), `goals.json`, `approvals.json`, `episodic.jsonl` (cap 400), `insights.jsonl` (cap 200), `conversations/<chatId>.jsonl`, `identity.md`.
+- **Layer 2 (semantic)**: Supabase Postgres + pgvector, embeddings by Cloudflare Workers AI `@cf/baai/bge-m3` (1024-dim, multilingual, Arabic-capable). Recall injects up to 7 relevant memory lines into chat prompts. Mirrors are best-effort with a 3-strike fuse — a sick database never eats the tick budget.
 
-`.github/workflows/agent-tick.yml` (this repo) POSTs `/api/agent/tick` every
-5 minutes with `AGENT_TICK_URL` + `AGENT_TICK_SECRET` repo secrets. The agent
-self-dispatches the same workflow for fast-follow ticks while working (chain
-cap 12). A daily keepalive commit prevents the 60-day schedule auto-disable.
+## Hard rules (paid for with production incidents)
 
-## Endpoints
+1. **Never walk providers sequentially** — race in waves; a slow provider loses, it does not block.
+2. **A JSON parse miss is not a provider outage** — strict retry at temperature ≤ 0.3, then degrade to `{reply: raw}`.
+3. **Garbled Arabic = environment, not model** — inject the local clock (`Africa/Algiers`), temperature 0.6, hard MSA rules in the system prompt.
+4. **Cloudflare Workers AI responses need `unwrap: 'result'`.**
+5. **Test providers from the deployment region** — geo-gating lies from a dev box.
+6. **Chaining is disciplined** — only on a successful tool call, ≥30 s spacing, hourly cap, LLM headroom reserved. (v3: the old build chained every ~15 s on failures and burned the daily budget by noon.)
+7. **Goal hygiene** — no goals filed from casual chat; junk titles (`#g_xxxx`) and duplicates are pruned; `currentTask` may only reference a goal that exists.
+8. **Algeria wall-clock math** — UTC+1 fixed offset, no DST; `07:46` means 06:46 UTC exactly.
+9. **Keepalive or the cron dies silently** — GitHub disables schedules after 60 idle days; the workflow commits `heartbeats/<date>.txt` daily.
+10. **Commit as the owner's noreply email** or Vercel's untrusted-author protection blocks the deploy.
+11. **Secrets are env-only** — the repo is public; GitHub Push Protection is a backstop, not a control.
+12. **Vercel REST API quirks** — deploy via `/v6`; env listing needs `/v9` for account tokens; Marketplace add-ons are dashboard-only.
 
-- `POST /api/agent/webhook` — Telegram (header `x-telegram-bot-api-secret-token`)
-- `POST /api/agent/tick` — scheduler (header `x-agent-secret`)
-- `POST /api/agent/setup-db` — idempotent Supabase DDL (header `x-agent-secret`)
+## Setup
 
-## Human-in-the-loop
+```bash
+cp .env.example .env   # fill values — never commit them
+bun install            # or npm install
+bun run dev            # local dashboard on :3000 (dev-open when AGENT_TICK_SECRET unset)
+```
 
-Risky actions (non-GET HTTP, writes outside the memory repo, public gists)
-queue for owner approval with inline Approve/Reject buttons in Telegram
-(`اعتماد` / `رفض`). Never executed without the owner's decision.
+One-time wiring:
 
-## Setup (fresh deploy)
+```bash
+# 1 · register the Telegram webhook (secret must byte-match AGENT_WEBHOOK_SECRET)
+curl -s "https://api.telegram.org/bot$AGENT_BOT_TOKEN/setWebhook" \
+  -d url="https://binary-agent.vercel.app/api/agent/webhook" \
+  -d secret_token="$AGENT_WEBHOOK_SECRET" \
+  -d drop_pending_updates=true \
+  -d allowed_updates='["message","callback_query"]'
 
-1. Push → import to Vercel (or use the existing project).
-2. Copy `.env.example` → set env vars in Vercel.
-3. `POST /api/agent/setup-db` once to create the pgvector schema.
-4. Register the Telegram webhook with the same secret you set.
-5. Add `AGENT_TICK_URL` + `AGENT_TICK_SECRET` as repo secrets → enable the workflow.
+# 2 · bootstrap the Supabase schema (idempotent)
+curl -s -X POST "https://binary-agent.vercel.app/api/agent/setup-db" \
+  -H "x-agent-secret: $AGENT_TICK_SECRET"
+
+# 3 · verify
+curl -s "https://binary-agent.vercel.app/api/agent/webhook"
+curl -s "https://api.telegram.org/bot$AGENT_BOT_TOKEN/getWebhookInfo"
+```
+
+GitHub repo secrets for the heartbeat workflow: `AGENT_TICK_URL` (the `/api/agent/tick` URL) and `AGENT_TICK_SECRET`.
+
+## Operator probes
+
+```bash
+curl -s "$BASE/api/agent/webhook"                                            # service banner
+curl -s -X POST "$BASE/api/agent/tick" -H "x-agent-secret: $TICK" \
+      -H "content-type: application/json" -d '{"source":"manual"}'           # full tick cycle
+curl -s -X POST "$BASE/api/agent/setup-db" -H "x-agent-secret: $TICK"        # idempotent DDL re-check
+```
+
+Telegram commands: `/start` · `/goals` · `/status` · `/stop` · `/resume` · `/ping`.

@@ -1,431 +1,450 @@
-// ─── Binary's tools — what the agent can actually DO ──────────────────────────
-// Free/open stack only: direct HTTP, DuckDuckGo search, node:vm sandbox,
-// GitHub (gists/files/issues), Telegram, and its own memory.
-// Every tool: pure function in, structured result out. Risky ones are gated.
+// ─── Tool belt — 12 tools, one call per tick, every call risk-classified ────
+// Tools marked APPROVAL are intercepted before execution and queued for the
+// owner; everything else executes inline within the tick's work budget.
+//
+// v3 fixes baked in here:
+//  · schedule_task — correct Algeria wall-clock math (the "07:46" reminders
+//    fired at the wrong instants before) + duplicate suppression.
+//  · add_goal / update_goal — goal hygiene: no junk titles, no duplicates,
+//    update_goal errors carry the live goal list so the LLM self-corrects.
+//  · web_search — 7-backend fail-fast chain, tuned for Arabic queries.
 
-import vm from 'node:vm';
-import { createGist, createIssue, writeFile as ghWriteFile, dispatchWorkflow } from './github';
-import { AGENT_CONFIG } from './config';
+import { runInNewContext } from 'node:vm';
+import { dzWallClockToEpoch, epochToWall, nextId } from './config';
+import { Goal, Memory, appendInsight, saveGoals, findActiveGoalByTitle, isJunkTitle } from './memory';
+import { sendApprovalButtons, sendTelegram } from './telegram';
+import { dispatchWorkflow, writeFile } from './github';
+import { REPOS, SECRETS } from './config';
 
-// ─── SSRF guard ──────────────────────────────────────────────────────────────
-const BLOCKED_HOST = /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.|\[?::1\]?$)/i;
+export type RiskClass = 'AUTO' | 'APPROVAL' | 'APPROVAL_PUBLIC';
 
-function guardUrl(u: string): { url: URL | null; error?: string } {
+export interface ToolDef {
+  name: string;
+  desc: string; // taught to the LLM
+  argsHint: string;
+  risk: RiskClass;
+}
+
+export const TOOLS: ToolDef[] = [
+  { name: 'web_search', desc: 'بحث في الويب عن معلومات وأخبار (يدعم العربية). يعيد عناوين وروابط ومقتطفات.', argsHint: '{"query":"..."}', risk: 'AUTO' },
+  { name: 'web_fetch', desc: 'جلب صفحة من رابط وقراءة نصها (يفضَّل بعد web_search).', argsHint: '{"url":"https://...","max_chars":7000}', risk: 'AUTO' },
+  { name: 'run_code', desc: 'تنفيذ حسابات JavaScript في صندوق رملي معزول (بلا شبكة).', argsHint: '{"code":"return 2+2"}', risk: 'AUTO' },
+  { name: 'http_request', desc: 'طلب HTTP مباشر (GET مباشرة؛ الطرق الأخرى تحتاج اعتماد المالك).', argsHint: '{"method":"GET","url":"https://..."}', risk: 'APPROVAL' },
+  { name: 'github_op', desc: 'عمليات GitHub: إنشاء ملاحظة (gist)، أو ملف. الملفات داخل مستودع الذاكرة مباشرة؛ خارجها تحتاج اعتمادًا.', argsHint: '{"op":"gist|write_file","...":"..."}', risk: 'APPROVAL' },
+  { name: 'send_message', desc: 'إرسال رسالة إلى المالك (نتائج، تحديثات، أسئلة).', argsHint: '{"text":"..."}', risk: 'AUTO' },
+  { name: 'request_approval', desc: 'طلب قرار المالك لأمر خطر أو غير قابل للعكس.', argsHint: '{"title":"...","reason":"..."}', risk: 'AUTO' },
+  { name: 'add_goal', desc: 'تبنّي هدف جديد (فقط إذا لم يوجد هدف مماثل نشط).', argsHint: '{"title":"...","description":"...","subtasks":["..."]}', risk: 'AUTO' },
+  { name: 'update_goal', desc: 'تحديث هدف قائم: إتمام مهمة فرعية أو تغيير الحالة أو إرفاق نتيجة.', argsHint: '{"goal_id":"g_xxx","subtask_index":0,"status":"done","result":"..."}', risk: 'AUTO' },
+  { name: 'remember', desc: 'تدوين درس دائم في الذاكرة طويلة الأمد.', argsHint: '{"text":"..."}', risk: 'AUTO' },
+  { name: 'schedule_task', desc: 'جدولة تذكير أو متابعة لاحقة بتوقيت الجزائر.', argsHint: '{"what":"...","in_minutes":30} أو {"what":"...","at":"07:46"}', risk: 'AUTO' },
+  { name: 'sleep', desc: 'إنهاء فترة العمل والنوم حتى المهمة المجدولة التالية.', argsHint: '{"minutes":45}', risk: 'AUTO' },
+];
+
+export const TOOL_MAP: Record<string, ToolDef> = Object.fromEntries(TOOLS.map((t) => [t.name, t]));
+
+export interface ToolResult { ok: boolean; summary: string; data?: unknown; queued?: ApprovalRequest }
+
+export interface ApprovalRequest { tool: string; args: Record<string, unknown>; title: string; reason: string }
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
+
+async function fetchT(url: string, init?: RequestInit, ms = 10_000): Promise<Response> {
+  const ctl = new AbortController();
+  const kill = setTimeout(() => ctl.abort(), ms);
   try {
-    const url = new URL(String(u));
-    if (!/^https?:$/.test(url.protocol)) return { url: null, error: 'only http/https allowed' };
-    if (BLOCKED_HOST.test(url.hostname)) return { url: null, error: 'private network addresses are blocked' };
-    return { url };
-  } catch {
-    return { url: null, error: 'invalid URL' };
-  }
+    return await fetch(url, {
+      ...init,
+      signal: ctl.signal,
+      headers: { 'user-agent': UA, 'accept-language': 'ar,en;q=0.8', ...(init?.headers || {}) },
+    });
+  } finally { clearTimeout(kill); }
 }
 
 function stripHtml(html: string): string {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&[a-z]+;/gi, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-async function timedFetch(url: string, init: any, ms: number): Promise<Response> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), ms);
+function ssrfGuard(url: string): string | null {
   try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
-  } finally {
-    clearTimeout(t);
+    const u = new URL(url);
+    if (!/^https?:$/.test(u.protocol)) return 'protocol must be http/https';
+    const host = u.hostname.toLowerCase();
+    if (
+      host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal') ||
+      /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+      /^169\.254\./.test(host) || host === '0.0.0.0' || host === 'metadata.google.internal' ||
+      /^ fd/.test(host) || host.includes('::1') || host.startsWith('fe80:')
+    ) return 'private/loopback hosts are blocked';
+    if (u.port && !['80', '443', '8080', '8443'].includes(u.port)) return 'port blocked';
+    return null;
+  } catch {
+    return 'invalid URL';
   }
 }
 
-// ─── individual tools ────────────────────────────────────────────────────────
+// ─── web_search: 7-backend fail-fast chain ──────────────────────────────────
+interface Hit { title: string; url: string; snippet: string }
 
-async function toolWebFetch(args: any): Promise<any> {
-  const g = guardUrl(args?.url);
-  if (!g.url) return { ok: false, error: g.error };
+async function searchWikipedia(query: string): Promise<Hit[]> {
   try {
-    const res = await timedFetch(
-      g.url.toString(),
-      { headers: { 'user-agent': 'Mozilla/5.0 (compatible; BinaryAgent/1.0)', accept: 'text/html,application/json,text/plain,*/*' } },
-      14000
-    );
-    const ctype = res.headers.get('content-type') || '';
-    const raw = await res.text();
-    const text = ctype.includes('html') ? stripHtml(raw) : raw;
-    const looksBlocked = [403, 429, 503].includes(res.status) || (text.length < 300 && /captcha|verify|robot/i.test(raw));
-    if (looksBlocked) throw new Error(`direct fetch blocked (HTTP ${res.status})`);
-    return { ok: res.ok, status: res.status, url: g.url.toString(), content: text.slice(0, Number(args?.max_chars) || 7000) };
-  } catch (e: any) {
-    // fallback: r.jina.ai reader proxy (free tier, returns clean markdown)
-    try {
-      const res = await timedFetch(
-        `https://r.jina.ai/${g.url.toString()}`,
-        { headers: { 'user-agent': 'BinaryAgent/1.0' } },
-        22000
-      );
-      if (!res.ok) return { ok: false, error: `direct: ${e?.message}; jina proxy: HTTP ${res.status}` };
-      const md = await res.text();
-      return { ok: true, url: g.url.toString(), via: 'jina-proxy', content: md.slice(0, Number(args?.max_chars) || 7000) };
-    } catch (e2: any) {
-      return { ok: false, error: `direct: ${String(e?.message || e).slice(0, 120)}; jina proxy: ${String(e2?.message || e2).slice(0, 120)}` };
+    const u = `https://ar.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&srlimit=5&origin=*`;
+    const r = await fetchT(u, {}, 9_000);
+    const j: any = await r.json();
+    return (j?.query?.search || []).map((s: any) => ({
+      title: String(s.title || ''),
+      url: `https://ar.wikipedia.org/wiki/${encodeURIComponent(String(s.title || '').replace(/ /g, '_'))}`,
+      snippet: stripHtml(String(s.snippet || '')).slice(0, 220),
+    }));
+  } catch { return []; }
+}
+
+async function searchDdgInstant(query: string): Promise<Hit[]> {
+  try {
+    const r = await fetchT(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`, {}, 9_000);
+    const j: any = await r.json();
+    const hits: Hit[] = [];
+    if (j?.AbstractText) hits.push({ title: j.Heading || query, url: j.AbstractURL || '', snippet: String(j.AbstractText).slice(0, 300) });
+    if (j?.Answer && !j.AbstractText) hits.push({ title: query, url: '', snippet: `الإجابة السريعة: ${String(j.Answer).slice(0, 300)}` });
+    for (const t of (j?.RelatedTopics || []).slice(0, 4)) {
+      if (t?.Text) hits.push({ title: String(t.Text).slice(0, 80), url: t?.FirstURL || '', snippet: String(t.Text).slice(0, 220) });
     }
-  }
+    return hits;
+  } catch { return []; }
 }
 
-function decodeDdgHref(href: string): string {
+function ddgUddg(href: string): string {
   try {
-    if (href.startsWith('//')) href = 'https:' + href;
     const u = new URL(href, 'https://duckduckgo.com');
     const uddg = u.searchParams.get('uddg');
     return uddg ? decodeURIComponent(uddg) : u.toString();
-  } catch {
-    return href;
-  }
+  } catch { return href; }
 }
 
-// ─── search backends (tried in order, all free, no keys) ────────────────────
-
-async function searchWikipediaLang(lang: string, q: string): Promise<any[]> {
-  const url = `https://${lang}.wikipedia.org/w/api.php?action=query&list=search&srlimit=6&srsearch=${encodeURIComponent(q)}&format=json&origin=*`;
-  const res = await timedFetch(url, { headers: { 'user-agent': 'BinaryAgent/1.0 (autonomous agent; https://github.com/bessghiermohamed/binary-agent)' } }, 10000);
-  if (!res.ok) throw new Error(`wiki-${lang} ${res.status}`);
-  const j: any = await res.json();
-  const hits = j?.query?.search || [];
-  if (!hits.length) throw new Error(`wiki-${lang} empty`);
-  return hits.map((r: any) => ({
-    title: r.title,
-    url: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(String(r.title).replace(/ /g, '_'))}`,
-    snippet: stripHtml(r.snippet || '').slice(0, 220),
-  }));
-}
-
-/** Google News RSS — reliable, no bot-wall, great for current/Arabic content. */
-async function searchGoogleNews(q: string): Promise<any[]> {
-  const loc = /[\u0600-\u06FF]/.test(q) ? 'hl=ar&gl=DZ&ceid=DZ:ar' : 'hl=en-US&gl=US&ceid=US:en';
-  const res = await timedFetch(`https://news.google.com/rss/search?${loc}&q=${encodeURIComponent(q)}`, { headers: { 'user-agent': 'BinaryAgent/1.0' } }, 10000);
-  if (!res.ok) throw new Error(`gnews ${res.status}`);
-  const xml = (await res.text()).replace(/<!\[CDATA\[|\]\]>/g, '');
-  const out: any[] = [];
-  const re = /<item>\s*<title>([\s\S]*?)<\/title>\s*<link>([\s\S]*?)<\/link>[\s\S]*?<pubDate>([\s\S]*?)<\/pubDate>/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(xml)) && out.length < 8) {
-    out.push({ title: stripHtml(m[1]).slice(0, 140), url: m[2].trim(), snippet: stripHtml(m[3]).slice(0, 160) });
-  }
-  if (!out.length) throw new Error('gnews no items');
-  return out;
-}
-
-/** DDG lite — POST endpoint, often less bot-walled than html.duckduckgo.com. */
-async function searchDdgLite(q: string): Promise<any[]> {
-  const res = await timedFetch(
-    'https://lite.duckduckgo.com/lite/',
-    { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }, body: `q=${encodeURIComponent(q)}` },
-    12000
-  );
-  if (!res.ok) throw new Error(`ddg-lite ${res.status}`);
-  const html = await res.text();
-  const results: any[] = [];
-  const re = /<a[^>]+class="result-link"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) && results.length < 8) {
-    results.push({ title: stripHtml(m[2]).slice(0, 120), url: decodeDdgHref(m[1]), snippet: '' });
-  }
-  if (!results.length) throw new Error('ddg-lite no results (likely bot-walled)');
-  return results;
-}
-
-async function searchDdgInstant(q: string): Promise<any[]> {
-  const res = await timedFetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_html=1`, { headers: { 'user-agent': 'BinaryAgent/1.0' } }, 9000);
-  if (!res.ok) throw new Error(`ddg-instant ${res.status}`);
-  const j: any = await res.json();
-  const out: any[] = [];
-  if (j?.AbstractText && j?.AbstractURL) out.push({ title: j.Heading || q, url: j.AbstractURL, snippet: String(j.AbstractText).slice(0, 220) });
-  for (const rt of (j?.RelatedTopics || []).slice(0, 6)) {
-    if (rt?.FirstURL) out.push({ title: String(rt.Text || '').split(' - ')[0].slice(0, 120), url: rt.FirstURL, snippet: String(rt.Text || '').slice(0, 220) });
-  }
-  if (!out.length) throw new Error('ddg-instant empty');
-  return out;
-}
-
-async function searchDdgHtml(q: string): Promise<any[]> {
-  const res = await timedFetch(
-    'https://html.duckduckgo.com/html/',
-    { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }, body: `q=${encodeURIComponent(q)}` },
-    12000
-  );
-  if (!res.ok) throw new Error(`ddg-html ${res.status}`);
-  const html = await res.text();
-  const results: any[] = [];
-  const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:class="result__snippet"[^>]*>([\s\S]*?)<\/a>)?/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) && results.length < 8) {
-    results.push({ title: stripHtml(m[2]).slice(0, 120), url: decodeDdgHref(m[1]), snippet: m[3] ? stripHtml(m[3]).slice(0, 220) : '' });
-  }
-  if (!results.length) throw new Error('ddg-html no results (likely bot-walled)');
-  return results;
-}
-
-async function searchJinaBing(q: string): Promise<any[]> {
-  const res = await timedFetch(
-    `https://r.jina.ai/https://www.bing.com/search?q=${encodeURIComponent(q)}&count=10`,
-    { headers: { 'user-agent': 'BinaryAgent/1.0' } },
-    24000
-  );
-  if (!res.ok) throw new Error(`jina-bing ${res.status}`);
-  const md = await res.text();
-  const out: any[] = [];
-  const seen = new Set<string>();
-  const re = /\[([^\]]{4,120})\]\((https?:\/\/[^\)\s]+)\)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(md)) && out.length < 8) {
-    const url = m[2];
-    if (/bing\.com|microsoft\.com\/en-us\/bing|jina\.ai|go\.microsoft/.test(url)) continue;
-    if (seen.has(url)) continue;
-    seen.add(url);
-    out.push({ title: m[1].trim().slice(0, 120), url, snippet: '' });
-  }
-  if (!out.length) throw new Error('jina-bing no links parsed');
-  return out;
-}
-
-async function searchMojeek(q: string): Promise<any[]> {
-  const res = await timedFetch(`https://www.mojeek.com/search?q=${encodeURIComponent(q)}`, { headers: { 'user-agent': 'Mozilla/5.0 (compatible; BinaryAgent/1.0)' } }, 10000);
-  if (!res.ok) throw new Error(`mojeek ${res.status}`);
-  const html = await res.text();
-  const out: any[] = [];
-  const re = /<a[^>]+class="title[^"]*"[^>]+href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) && out.length < 8) {
-    out.push({ title: stripHtml(m[2]).slice(0, 120), url: m[1], snippet: '' });
-  }
-  if (!out.length) throw new Error('mojeek no results parsed');
-  return out;
-}
-
-async function toolWebSearch(args: any): Promise<any> {
-  const q = String(args?.query || '').slice(0, 300);
-  if (!q) return { ok: false, error: 'query required' };
-  const attempts: string[] = [];
-  const hasArabic = /[\u0600-\u06FF]/.test(q);
-  const backends: [string, (query: string) => Promise<any[]>][] = [];
-  if (hasArabic) backends.push(['wikipedia-ar', (x) => searchWikipediaLang('ar', x)]);
-  backends.push(
-    ['wikipedia-en', (x) => searchWikipediaLang('en', x)],
-    ['gnews', searchGoogleNews],
-    ['ddg-lite', searchDdgLite],
-    ['ddg-instant', searchDdgInstant],
-    ['ddg-html', searchDdgHtml],
-    ['jina-bing', searchJinaBing],
-    ['mojeek', searchMojeek]
-  );
-  for (const [name, fn] of backends) {
-    try {
-      const results = await fn(q);
-      if (results.length) return { ok: true, backend: name, query: q, results };
-      attempts.push(`${name}: empty`);
-    } catch (e: any) {
-      attempts.push(`${name}: ${String(e?.message || e).slice(0, 60)}`);
+async function searchDdgHtml(query: string): Promise<Hit[]> {
+  try {
+    const r = await fetchT(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {}, 10_000);
+    const html = await r.text();
+    const hits: Hit[] = [];
+    const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html)) && hits.length < 6) {
+      hits.push({ title: stripHtml(m[2]).slice(0, 120), url: ddgUddg(m[1]), snippet: '' });
     }
-  }
-  return { ok: false, error: `all search backends failed — ${attempts.join(' | ')}` };
+    return hits;
+  } catch { return []; }
 }
 
-async function toolRunCode(args: any): Promise<any> {
-  const code = String(args?.code || '');
-  if (!code.trim()) return { ok: false, error: 'code required' };
-  if (code.length > 8000) return { ok: false, error: 'code too long (max 8000 chars)' };
-  const timeoutMs = Math.min(Number(args?.timeout_ms) || 6000, 6000);
-  const logs: string[] = [];
-  const sandbox: any = {
-    console: {
-      log: (...a: any[]) => logs.push(a.map((x) => safeStr(x)).join(' ').slice(0, 400)),
-    },
-    Math,
-    JSON,
-    Date,
-    RegExp,
-    String,
-    Number,
-    Boolean,
-    Array,
-    Object,
-    Map,
-    Set,
-    Intl,
-  };
+async function searchDdgLite(query: string): Promise<Hit[]> {
   try {
-    const result = vm.runInNewContext(code, sandbox, { timeout: timeoutMs, displayErrors: true });
-    return { ok: true, result: safeStr(result).slice(0, 3000), logs: logs.slice(0, 20) };
-  } catch (e: any) {
-    return { ok: false, error: `${String(e?.message || e).slice(0, 300)}`, logs: logs.slice(0, 20) };
-  }
-}
-
-function safeStr(x: any): string {
-  try {
-    if (typeof x === 'string') return x.slice(0, 500);
-    if (x === undefined) return 'undefined';
-    return JSON.stringify(x)?.slice(0, 500) ?? String(x);
-  } catch {
-    return String(x).slice(0, 200);
-  }
-}
-
-async function toolHttpRequest(args: any): Promise<any> {
-  const g = guardUrl(args?.url);
-  if (!g.url) return { ok: false, error: g.error };
-  const method = String(args?.method || 'GET').toUpperCase();
-  try {
-    const res = await timedFetch(
-      g.url.toString(),
-      {
-        method,
-        headers: { 'user-agent': 'BinaryAgent/1.0', ...(args?.headers || {}) },
-        body: args?.body != null ? (typeof args.body === 'string' ? args.body : JSON.stringify(args.body)) : undefined,
-      },
-      14000
-    );
-    const text = await res.text();
-    return { ok: res.ok, status: res.status, content: text.slice(0, 6000) };
-  } catch (e: any) {
-    return { ok: false, error: String(e?.message || e).slice(0, 200) };
-  }
-}
-
-async function toolGithubOp(args: any): Promise<any> {
-  const token = AGENT_CONFIG.ghToken;
-  if (!token) return { ok: false, error: 'no AGENT_GH_TOKEN configured' };
-  const op = String(args?.op || '');
-  const memRepo = AGENT_CONFIG.memoryRepo;
-  if (op === 'gist') {
-    const files: Record<string, string> = {};
-    for (const [name, content] of Object.entries(args?.files || {})) files[String(name).slice(0, 60)] = String(content).slice(0, 40000);
-    if (!Object.keys(files).length) return { ok: false, error: 'files required' };
-    const r = await createGist(token, files, String(args?.description || 'from Binary'), !!args?.public);
-    return r.ok ? { ok: true, url: r.url } : { ok: false, error: r.error };
-  }
-  if (op === 'write_file') {
-    const repo = String(args?.repo || memRepo);
-    if (!/\//.test(repo)) return { ok: false, error: 'repo must be owner/name' };
-    return ghWriteFile(token, repo, String(args?.path || ''), String(args?.content || ''), `murad-agent: ${String(args?.message || 'write')}`);
-  }
-  if (op === 'issue') {
-    const repo = String(args?.repo || AGENT_CONFIG.schedulerRepo);
-    if (!/\//.test(repo)) return { ok: false, error: 'repo must be owner/name' };
-    return createIssue(token, repo, String(args?.title || 'note'), String(args?.body || ''));
-  }
-  return { ok: false, error: `unknown github op: ${op} (use gist | write_file | issue)` };
-}
-
-async function toolDispatchTick(args: any): Promise<any> {
-  const token = AGENT_CONFIG.ghToken;
-  if (!token) return { ok: false, error: 'no AGENT_GH_TOKEN configured' };
-  const r = await dispatchWorkflow(token, AGENT_CONFIG.schedulerRepo, 'agent-tick.yml', {
-    source: String(args?.source || 'chain'),
-  });
-  return r.ok ? { ok: true } : { ok: false, error: r.error };
-}
-
-// ─── registry ────────────────────────────────────────────────────────────────
-// `local` tools mutate memory and are executed by brain.ts (they need the
-// memory bundle). Here: pure/external tools only.
-
-export interface ToolCtx {
-  ownerChatId: string;
-  goalId?: string;
-}
-
-export interface ToolDef {
-  name: string;
-  desc: string;
-  args: string; // compact schema hint for the prompt
-  risky?: (args: any) => true | string; // true = always approve; string = reason
-}
-
-export const TOOLS: ToolDef[] = [
-  { name: 'web_search', desc: 'Search the web (DuckDuckGo) and get titles/URLs/snippets.', args: '{query}' },
-  { name: 'web_fetch', desc: 'Fetch a URL and get readable text (HTML stripped, JSON as-is).', args: '{url, max_chars?}' },
-  {
-    name: 'run_code',
-    desc: 'Run pure JavaScript (node vm sandbox, no network/timers/fs) for math, parsing, text processing. Last expression is the result.',
-    args: '{code, timeout_ms?}',
-  },
-  {
-    name: 'http_request',
-    desc: 'Raw HTTP request to any public API (GET is free to use; any other method needs owner approval).',
-    args: '{method, url, headers?, body?}',
-    risky: (a) => String(a?.method || 'GET').toUpperCase() !== 'GET' && 'non-GET request changes things on an external service',
-  },
-  {
-    name: 'github_op',
-    desc: 'GitHub actions: create a gist (share code/files), write a file into a repo (own memory repo by default; other repos need approval), open an issue.',
-    args: "{op: 'gist'|'write_file'|'issue', files?|repo?+path?+content?, title?, body?}",
-    risky: (a) =>
-      (a?.op === 'write_file' && a?.repo && a.repo !== AGENT_CONFIG.memoryRepo && 'writing into a repo other than my memory') ||
-      (a?.op === 'issue' && a?.repo && a.repo !== AGENT_CONFIG.schedulerRepo && 'opening an issue on an external repo') ||
-      (a?.op === 'gist' && a?.public && 'making content public on the internet'),
-  },
-  { name: 'send_message', desc: 'Send a Telegram message to the owner. Use for updates, questions, results, or just talking.', args: '{text}' },
-  {
-    name: 'request_approval',
-    desc: 'Ask the owner to approve an action you consider risky or expensive. Work pauses until they decide.',
-    args: '{tool, args(object), reason}',
-  },
-  { name: 'add_goal', desc: 'Adopt a new goal (from owner requests or your own initiative).', args: '{title, description?, subtasks?(string[])}' },
-  {
-    name: 'update_goal',
-    desc: 'Update a goal: mark progress, tick a subtask done, add a note, or finish/fail/block it.',
-    args: '{goal_id, status?(!active|!blocked|!waiting_approval|!done|!failed|!cancelled), check_subtask?(id), add_subtasks?(string[]), add_note?, result?}',
-  },
-  { name: 'remember', desc: 'Save a durable lesson or fact to long-term memory (survives restarts, shapes future behavior).', args: '{text}' },
-  { name: 'schedule_task', desc: 'Schedule a future check (reminder, follow-up, monitoring). Fires on a later tick.', args: '{what, in_minutes?, at_iso?}' },
-  { name: 'sleep', desc: 'Go idle for N minutes (end work period, wait for next scheduled wake).', args: '{minutes?}' },
-];
-
-export const TOOL_MAP: Record<string, ToolDef> = Object.fromEntries(TOOLS.map((t) => [t.name, t]));
-
-/** Execute an external/pure tool. Local (memory-touching) ones return marker. */
-export async function execTool(name: string, args: any, ctx: ToolCtx): Promise<any> {
-  switch (name) {
-    case 'web_search':
-      return toolWebSearch(args);
-    case 'web_fetch':
-      return toolWebFetch(args);
-    case 'run_code':
-      return toolRunCode(args);
-    case 'http_request':
-      return toolHttpRequest(args);
-    case 'github_op':
-      return toolGithubOp(args);
-    case 'dispatch_tick':
-      return toolDispatchTick(args);
-    case 'send_message': {
-      const { sendTelegram } = await import('./telegram');
-      const chatId = args?.chat_id || ctx.ownerChatId;
-      if (!chatId) return { ok: false, error: 'no known chat to message (owner not pinned yet)' };
-      const r = await sendTelegram(chatId, String(args?.text || '').slice(0, 3800));
-      return r;
+    // POST form — often less bot-walled (spec §8)
+    const r = await fetchT('https://lite.duckduckgo.com/lite/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: `q=${encodeURIComponent(query)}`,
+    }, 10_000);
+    const html = await r.text();
+    const hits: Hit[] = [];
+    const re = /<a[^>]+href="([^"]+)"[^>]*class=.result-link.[^>]*>([\s\S]*?)<\/a>/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html)) && hits.length < 6) {
+      const url = ddgUddg(m[1]);
+      if (url.startsWith('http')) hits.push({ title: stripHtml(m[2]).slice(0, 120), url, snippet: '' });
     }
-    default:
-      return { __local__: true }; // add_goal, update_goal, remember, schedule_task, sleep, request_approval
+    return hits;
+  } catch { return []; }
+}
+
+async function searchGoogleNewsDz(query: string): Promise<Hit[]> {
+  try {
+    // pinned to Algeria / Arabic — the key fix for Arabic current-events (spec §8)
+    const r = await fetchT(`https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=ar&gl=DZ&ceid=DZ:ar`, {}, 10_000);
+    const xml = await r.text();
+    const hits: Hit[] = [];
+    const re = /<item><title>([\s\S]*?)<\/title><link>([\s\S]*?)<\/link>(?:<description>([\s\S]*?)<\/description>)?/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(xml)) && hits.length < 6) {
+      hits.push({ title: stripHtml(m[1]).slice(0, 140), url: m[2].trim(), snippet: m[3] ? stripHtml(m[3]).slice(0, 220) : '' });
+    }
+    return hits;
+  } catch { return []; }
+}
+
+async function searchBingViaJina(query: string): Promise<Hit[]> {
+  try {
+    const r = await fetchT(`https://r.jina.ai/https://www.bing.com/search?q=${encodeURIComponent(query)}`, {}, 12_000);
+    const text = await r.text();
+    const hits: Hit[] = [];
+    const re = /\[([^\]]{6,120})\]\((https?:\/\/[^)]+bing[^)]*|https?:\/\/[^)]{10,})\)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) && hits.length < 6) {
+      const url = m[2];
+      if (/bing\.com|microsoft\.com\/bing/.test(url)) continue;
+      hits.push({ title: m[1].slice(0, 120), url, snippet: '' });
+    }
+    return hits;
+  } catch { return []; }
+}
+
+async function searchMojeek(query: string): Promise<Hit[]> {
+  try {
+    const r = await fetchT(`https://www.mojeek.com/search?q=${encodeURIComponent(query)}`, {}, 10_000);
+    const html = await r.text();
+    const hits: Hit[] = [];
+    const re = /<a[^>]+class="title"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html)) && hits.length < 6) {
+      hits.push({ title: stripHtml(m[2]).slice(0, 120), url: m[1], snippet: '' });
+    }
+    return hits;
+  } catch { return []; }
+}
+
+async function webSearch(query: string): Promise<Hit[]> {
+  const isArabic = /[\u0600-\u06FF]/.test(query);
+  const backends = [
+    ...(isArabic ? [searchWikipedia] : []),
+    searchDdgInstant,
+    searchDdgHtml,
+    searchDdgLite,
+    searchGoogleNewsDz,
+    searchBingViaJina,
+    searchMojeek,
+  ];
+  for (const backend of backends) {
+    const hits = await backend(query);
+    if (hits.length >= 2) return hits.slice(0, 6);
+  }
+  return [];
+}
+
+// ─── the executor ────────────────────────────────────────────────────────────
+// brain.ts intercepts APPROVAL-risk calls before execTool; execTool itself
+// executes AUTO-class tools only.
+export async function execTool(m: Memory, tool: string, rawArgs: Record<string, unknown>): Promise<ToolResult> {
+  const args = rawArgs || {};
+  try {
+    switch (tool) {
+      case 'web_search': {
+        const query = String(args.query || '').trim();
+        if (!query) return { ok: false, summary: 'web_search: query مطلوب' };
+        const hits = await webSearch(query);
+        if (!hits.length) return { ok: false, summary: 'web_search: تعذّر البحث (كل المصادر محجوبة) — جرّب صياغة أخرى' };
+        return {
+          ok: true,
+          summary: hits.map((h) => `• ${h.title} — ${h.url}${h.snippet ? ` — ${h.snippet}` : ''}`).join('\n').slice(0, 2200),
+          data: hits,
+        };
+      }
+      case 'web_fetch': {
+        const url = String(args.url || '');
+        const guard = ssrfGuard(url);
+        if (guard) return { ok: false, summary: `web_fetch: ${guard}` };
+        const maxChars = Math.min(Number(args.max_chars) || 7000, 12000);
+        try {
+          const r = await fetchT(url, {}, 12_000);
+          const ct = r.headers.get('content-type') || '';
+          const body = await r.text();
+          if (ct.includes('json')) return { ok: true, summary: body.slice(0, maxChars) };
+          const text = stripHtml(body);
+          if (text.length < 80) throw new Error('thin content');
+          return { ok: true, summary: text.slice(0, maxChars) };
+        } catch {
+          // r.jina.ai reader fallback (spec §8)
+          try {
+            const r2 = await fetchT(`https://r.jina.ai/${url}`, {}, 14_000);
+            const t2 = (await r2.text()).slice(0, maxChars);
+            if (t2.trim().length > 40) return { ok: true, summary: t2 };
+            return { ok: false, summary: 'web_fetch: تعذّر قراءة الصفحة' };
+          } catch {
+            return { ok: false, summary: 'web_fetch: فشل الجلب' };
+          }
+        }
+      }
+      case 'run_code': {
+        const code = String(args.code || '');
+        if (!code.trim()) return { ok: false, summary: 'run_code: code مطلوب' };
+        if (/\brequire\s*\(|\bprocess\b|\bimport\s*\(|fetch\s*\(|net\s*\./i.test(code)) {
+          return { ok: false, summary: 'run_code: العمليات الشبكية أو النظامية ممنوعة — الحسابات فقط' };
+        }
+        try {
+          const sandbox: Record<string, unknown> = { console: { log: () => {} }, Math, JSON, Date, Number, String, Array, Object };
+          const result = runInNewContext(`(function(){ ${code} })()`, sandbox, { timeout: 2000 });
+          return { ok: true, summary: `run_code → ${JSON.stringify(result ?? null).slice(0, 1500)}` };
+        } catch (e: any) {
+          return { ok: false, summary: `run_code خطأ: ${String(e?.message || e).slice(0, 300)}` };
+        }
+      }
+      case 'http_request': {
+        const url = String(args.url || '');
+        const guard = ssrfGuard(url);
+        if (guard) return { ok: false, summary: `http_request: ${guard}` };
+        const r = await fetchT(url, { method: 'GET' }, 12_000);
+        const body = (await r.text()).slice(0, 1500);
+        return { ok: r.ok, summary: `HTTP ${r.status} — ${body.slice(0, 1200)}` };
+      }
+      case 'github_op': {
+        const op = String(args.op || '');
+        if (op === 'gist') {
+          // public gists are approval-gated by the brain; reaching here means approved
+          const content = String(args.content || '');
+          const r = await fetch('https://api.github.com/gists', {
+            method: 'POST',
+            headers: { authorization: `Bearer ${SECRETS.ghToken}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ description: String(args.description || 'Binary Agent note'), public: false, files: { note: { content } } }),
+          });
+          const j: any = await r.json().catch(() => null);
+          if (!r.ok) return { ok: false, summary: `gist: HTTP ${r.status}` };
+          return { ok: true, summary: `gist created (secret): ${j?.id || ''}` };
+        }
+        if (op === 'write_file') {
+          const path = String(args.path || '');
+          const content = String(args.content || '');
+          if (!path) return { ok: false, summary: 'write_file: path مطلوب' };
+          const w = await writeFile(REPOS.memory, path, content, `agent note: ${path}`);
+          return w.ok ? { ok: true, summary: `كُتب ${path} في مستودع الذاكرة` } : { ok: false, summary: `write_file فشل: ${w.error}` };
+        }
+        if (op === 'issue') {
+          const r = await fetch(`https://api.github.com/repos/${REPOS.scheduler}/issues`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${SECRETS.ghToken}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ title: String(args.title || 'Agent issue'), body: String(args.body || '').slice(0, 4000) }),
+          });
+          const j: any = await r.json().catch(() => null);
+          return r.ok ? { ok: true, summary: `issue #${j?.number} created` } : { ok: false, summary: `issue: HTTP ${r.status}` };
+        }
+        return { ok: false, summary: 'github_op: op غير معروف' };
+      }
+      case 'send_message': {
+        const text = String(args.text || '').trim();
+        const chatId = m.state.ownerChatId;
+        if (!chatId) return { ok: false, summary: 'send_message: لا يوجد مالك مثبّت بعد' };
+        const sent = await sendTelegram(chatId, text);
+        return sent ? { ok: true, summary: `أُرسلت رسالة إلى المالك (${text.length} حرفًا)` } : { ok: false, summary: 'send_message: فشل الإرسال' };
+      }
+      case 'request_approval': {
+        const chatId = m.state.ownerChatId;
+        const id = nextId('appr');
+        const req: ApprovalRequest = { tool: 'manual', args: {}, title: String(args.title || 'طلب اعتماد'), reason: String(args.reason || '') };
+        if (!chatId) return { ok: false, summary: 'request_approval: لا يوجد مالك — رُفض الإجراء' };
+        await sendApprovalButtons(chatId, req.title, req.reason, id);
+        return { ok: true, summary: `أُرسل طلب اعتماد ${id} إلى المالك`, queued: { ...req, tool: 'noop', args: { note: req.reason } } };
+      }
+      case 'add_goal': {
+        const title = String(args.title || '').trim();
+        if (isJunkTitle(title)) return { ok: false, summary: 'add_goal: العنوان غير صالح — اكتب عنوانًا واضحًا بالعربية' };
+        const dup = findActiveGoalByTitle(m.goals, title);
+        if (dup) {
+          return { ok: true, summary: `الهدف موجود أصلًا: ${dup.id} "${dup.title}" (الحالة: ${dup.status}) — لا حاجة لهدف جديد`, data: { goalId: dup.id } };
+        }
+        const activeCount = m.goals.filter((g) => g.status === 'active').length;
+        if (activeCount >= 12) return { ok: false, summary: `add_goal: بلغنا الحد الأقصى (12 هدفًا نشطًا) — أكمل أو أغلق هدفًا أولًا` };
+        const goal: Goal = {
+          id: nextId('g'),
+          title,
+          description: String(args.description || '').slice(0, 500) || undefined,
+          subtasks: (Array.isArray(args.subtasks) ? args.subtasks : []).slice(0, 12).map((s: unknown) => ({ title: String(s).slice(0, 200), done: false })),
+          status: 'active',
+          notes: [],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+        m.goals.push(goal);
+        const saved = await saveGoals(m, `goal added: ${title.slice(0, 40)}`);
+        return saved
+          ? { ok: true, summary: `أُضيف هدف ${goal.id} "${title}" (${goal.subtasks.length} مهمة فرعية)`, data: { goalId: goal.id } }
+          : { ok: false, summary: 'add_goal: فشل الحفظ في GitHub' };
+      }
+      case 'update_goal': {
+        const goal = m.goals.find((g) => g.id.toLowerCase() === String(args.goal_id || '').replace(/^#/, '').toLowerCase());
+        if (!goal) {
+          const live = m.goals.filter((g) => g.status === 'active').map((g) => `${g.id} "${g.title}"`).join(' | ') || 'لا أهداف نشطة';
+          return { ok: false, summary: `update_goal: لا هدف بهذا المعرف. الأهداف النشطة الآن: ${live.slice(0, 700)}` };
+        }
+        if (args.subtask_index != null) {
+          const idx = Number(args.subtask_index);
+          if (!goal.subtasks[idx]) return { ok: false, summary: `update_goal: لا مهمة فرعية رقم ${idx} (الموجود: 0..${goal.subtasks.length - 1})` };
+          goal.subtasks[idx].done = args.subtask_done === false ? false : true;
+        }
+        if (args.add_subtasks) {
+          for (const s of (Array.isArray(args.add_subtasks) ? args.add_subtasks : []).slice(0, 6)) {
+            if (goal.subtasks.length < 12) goal.subtasks.push({ title: String(s).slice(0, 200), done: false });
+          }
+        }
+        if (args.status && ['active', 'waiting_approval', 'done', 'failed'].includes(String(args.status))) {
+          goal.status = args.status as Goal['status'];
+          if (args.status === 'done' || args.status === 'failed') {
+            goal.result = String(args.result || goal.result || '').slice(0, 2000) || undefined;
+            m.state.totals.goalsDone += args.status === 'done' ? 1 : 0;
+            if (m.state.currentTask?.goalId === goal.id) m.state.currentTask = null;
+          }
+        } else if (args.result) {
+          goal.result = String(args.result).slice(0, 2000);
+        }
+        if (args.note) goal.notes.push(String(args.note).slice(0, 300));
+        goal.updatedAt = Date.now();
+        const saved = await saveGoals(m, `goal updated: ${goal.id}`);
+        const doneCount = goal.subtasks.filter((s) => s.done).length;
+        return saved
+          ? { ok: true, summary: `goal ${goal.id} "${goal.title}" → ${goal.status} (${doneCount}/${goal.subtasks.length} مهام)` }
+          : { ok: false, summary: 'update_goal: فشل الحفظ' };
+      }
+      case 'remember': {
+        const text = String(args.text || '').trim();
+        if (!text) return { ok: false, summary: 'remember: text مطلوب' };
+        await appendInsight(text.slice(0, 500));
+        return { ok: true, summary: `دُوّن درس: ${text.slice(0, 120)}` };
+      }
+      case 'schedule_task': {
+        const what = String(args.what || '').trim();
+        if (!what) return { ok: false, summary: 'schedule_task: what مطلوب' };
+        let dueAt = 0;
+        if (args.at) {
+          dueAt = dzWallClockToEpoch(String(args.at)) ?? 0;
+          if (!dueAt) return { ok: false, summary: 'schedule_task: صيغة الوقت غير مفهومة — استخدم HH:MM أو YYYY-MM-DD HH:MM بتوقيت الجزائر' };
+        } else if (args.in_minutes != null || args.in_minutes_or_seconds != null) {
+          const n = Number(args.in_minutes ?? args.in_minutes_or_seconds ?? 30);
+          // guard against the LLM emitting seconds by mistake
+          const minutes = n > 0 && n < 90 ? n : Math.max(1, Math.round(n / 60));
+          dueAt = Date.now() + minutes * 60_000;
+        } else if (args.at_iso) {
+          const t = Date.parse(String(args.at_iso));
+          if (!Number.isFinite(t)) return { ok: false, summary: 'schedule_task: at_iso غير صالح' };
+          dueAt = t;
+        } else {
+          dueAt = Date.now() + 30 * 60_000;
+        }
+        // duplicate suppression — same normalized what within 2-minute window
+        const dup = m.state.scheduled.find((t) => Math.abs(t.dueAt - dueAt) < 120_000 && t.what.trim() === what);
+        if (dup) return { ok: true, summary: `المهمة مجدولة أصلًا (${dup.id} عند ${epochToWall(dup.dueAt)})` };
+        const task = { id: nextId('t'), what, dueAt, createdAt: Date.now(), goalId: m.state.currentTask?.goalId };
+        m.state.scheduled.push(task);
+        return { ok: true, summary: `جُدولت "${what}" عند ${epochToWall(dueAt)} بتوقيت الجزائر (${task.id})` };
+      }
+      case 'sleep': {
+        const minutes = Math.max(5, Math.min(Number(args.minutes) || 45, 480));
+        m.state.nextWakeAt = Date.now() + minutes * 60_000;
+        m.state.chainCount = 0;
+        return { ok: true, summary: `سأنام ${minutes} دقيقة حتى المهمة التالية` };
+      }
+      default:
+        return { ok: false, summary: `أداة غير معروفة: ${tool}` };
+    }
+  } catch (e: any) {
+    return { ok: false, summary: `${tool} خطأ: ${String(e?.message || e).slice(0, 250)}` };
   }
 }
 
-/** Human-readable summary of tool args for logs/episodes. */
-export function describeArgs(args: any): string {
-  try {
-    const s = JSON.stringify(args);
-    return (s || '').length > 160 ? s.slice(0, 157) + '…' : s || '{}';
-  } catch {
-    return '{}';
-  }
+/** Chain fast-follow: dispatch the tick workflow (used by brain). */
+export async function dispatchTick(source: 'chain' | 'manual' | 'cron'): Promise<{ ok: boolean; error?: string }> {
+  if (!SECRETS.ghToken) return { ok: false, error: 'no gh token' };
+  return dispatchWorkflow(REPOS.scheduler, 'agent-tick.yml', { source });
 }

@@ -1,7 +1,7 @@
-// ─── Binary (بيناري) — autonomous agent configuration ────────────────────────
-// Binary (@PaymonB_bot) is a general-purpose autonomous agent based in Tiaret,
-// Algeria who speaks Modern Standard Arabic. Standalone deployment: own repo,
-// own Vercel project, own memory repo and Supabase project.
+// ─── Binary — identity, budgets, cadence, time ──────────────────────────────
+// Single source of truth for who the agent is. Interpolated everywhere:
+// system prompts, Telegram branding, status headers, dashboard. Never
+// hard-code identity strings elsewhere.
 
 export const AGENT = {
   id: 'binary',
@@ -9,77 +9,107 @@ export const AGENT = {
   nameAr: 'بيناري',
   username: 'PaymonB_bot',
   numericId: 8918299308,
-  // Bot token comes from the environment only (never committed).
-  token: process.env.AGENT_BOT_TOKEN || '',
-  primaryProvider: 'gemini',
+  botToken: process.env.AGENT_BOT_TOKEN || '',
   home: 'Tiaret, Algeria',
+  homeAr: 'تيارت، الجزائر',
   language: 'Modern Standard Arabic (العربية الفصحى)',
+  timezone: 'Africa/Algiers', // UTC+1 year-round, no DST
+  version: 2,
+} as const;
+
+export const REPOS = {
+  memory: process.env.AGENT_MEMORY_REPO || 'bessghiermohamed/binary-agent-memory',
+  scheduler: process.env.AGENT_SCHEDULER_REPO || 'bessghiermohamed/binary-agent',
 };
 
-export const AGENT_CONFIG = {
-  // Where the agent's mind lives (GitHub repo, Contents API = free durable DB)
-  memoryRepo: process.env.AGENT_MEMORY_REPO || 'bessghiermohamed/binary-agent-memory',
-  // Token used at runtime for memory writes, dispatches, gists
+export const SECRETS = {
   ghToken: process.env.AGENT_GH_TOKEN || '',
-  // Guard for the tick endpoint (cron + scheduler hit it from outside)
-  tickSecret: process.env.AGENT_TICK_SECRET || '',
-  // Scheduler: THIS repo carries its own heartbeat workflow
-  // (.github/workflows/agent-tick.yml) — one repo, no separate loop repo.
-  // Used for chained fast-follow ticks.
-  schedulerRepo: process.env.AGENT_SCHEDULER_REPO || 'bessghiermohamed/binary-agent',
-  // Telegram webhook shared secret
   webhookSecret: process.env.AGENT_WEBHOOK_SECRET || '',
-  // Owner: pinned automatically on first private DM unless preset here
+  tickSecret: process.env.AGENT_TICK_SECRET || '',
   ownerChatId: process.env.AGENT_OWNER_CHAT_ID || '',
-
-  // ── budgets (soft caps; the agent reports when it hits them) ──
-  LLM_DAILY_CAP: 220, // LLM calls per day across decide/chat/reflect
-  TICKS_DAILY_CAP: 400,
-  CHAIN_CAP: 12, // max chained fast-follow ticks per work period
-  INITIATIVE_GAP_MS: 45 * 60_000, // min pause between self-started initiatives
-  CHAT_REPLY_MAX_TOKENS: 380,
-  DECIDE_MAX_TOKENS: 900,
-  REFLECT_MAX_TOKENS: 320,
-
-  // ── cadence ──
-  LOCK_MS: 120_000, // distributed lock TTL (state.json CAS via GitHub)
-  WORK_BUDGET_MS: 50_000, // stay under Vercel function limit
-
-  // ── risk gate: actions that ALWAYS require owner approval ──
-  ALWAYS_APPROVE_TOOLS: ['http_non_get', 'github_write_outside_memory'],
 };
 
-export const TZ_LABEL = 'Africa/Algiers';
+// Soft caps — a free deployment must never runaway-spend (spec §6).
+export const BUDGETS = {
+  llmDaily: 220, // LLM calls per day
+  ticksDaily: 400, // ticks per day
+  chainCap: 12, // chained ticks per work period
+  chainSpacingMs: 30_000, // min gap between chain dispatches (was: none!)
+  chainHourly: 20, // hard cap of chain dispatches per rolling hour
+  initiativeGapMs: 45 * 60_000, // min gap between self-started initiatives
+  workBudgetMs: 50_000, // per-invocation work budget (under Vercel 60s)
+  llmHeadroomForChain: 25, // reserve llm calls before allowing a chain
+} as const;
 
-// ─── time helpers (owner timezone) ───────────────────────────────────────────
-export function nowParts(d = new Date()) {
-  const utc = d.toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
-  const alg = new Date(d.getTime() + 60 * 60_000).toISOString().replace('T', ' ').slice(0, 16);
-  return { utc, alg: alg + ' owner-local (UTC+1)' };
+// Token ceilings per call type (spec §6).
+export const TOKEN_CEIL = { chat: 380, decide: 900, reflect: 320 } as const;
+
+// LLM cortex timing (spec §5).
+export const LLM_CFG = {
+  callTimeoutMs: 14_000,
+  overallBudgetMs: 42_000,
+  breakThreshold: 2,
+  breakMs: 8 * 60_000,
+} as const;
+
+export const MEMORY_CAPS = {
+  episodes: 400,
+  insights: 200,
+  conversationWindow: 24, // lines kept per chat file
+  episodesInPrompt: 12,
+  insightsInPrompt: 5,
+} as const;
+
+// ─── Time helpers — the clock the agent trusts (RULE 03) ───────────────────
+// Algeria is UTC+1 with no DST: a fixed offset converts wall-clock to UTC
+// exactly. `at_iso` inputs without timezone info are interpreted as Algeria
+// local time and converted with this offset — the previous build scheduled
+// "07:46" reminders for the wrong instant because it mixed the two frames.
+
+const DZ_OFFSET_MIN = 60;
+
+export function dzNow(): { isoUtc: string; wall: string; wallAr: string; epochMs: number } {
+  const now = new Date();
+  const wall = new Date(now.getTime() + DZ_OFFSET_MIN * 60_000);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const wallStr = `${wall.getUTCFullYear()}-${pad(wall.getUTCMonth() + 1)}-${pad(wall.getUTCDate())} ${pad(wall.getUTCHours())}:${pad(wall.getUTCMinutes())}`;
+  const dayAr = ['الأحد', 'الاثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة', 'السبت'][wall.getUTCDay()];
+  const wallAr = `${dayAr} ${pad(wall.getUTCDate())}/${pad(wall.getUTCMonth() + 1)}/${wall.getUTCFullYear()} — الساعة ${pad(wall.getUTCHours())}:${pad(wall.getUTCMinutes())} بتوقيت الجزائر`;
+  return { isoUtc: now.toISOString(), wall: wallStr, wallAr, epochMs: now.getTime() };
 }
 
-export function dayKey(d = new Date()): string {
-  return new Date(d.getTime() + 60 * 60_000).toISOString().slice(0, 10); // owner-local day
-}
-
-/** Full local date/time at home (Africa/Algiers), e.g. "Sunday 21 September 2026 at 13:45". */
-export function localNow(d = new Date()): string {
-  try {
-    return new Intl.DateTimeFormat('en-GB', {
-      timeZone: 'Africa/Algiers',
-      weekday: 'long',
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    }).format(d);
-  } catch {
-    return nowParts().alg;
+/** Interpret a wall-clock string (HH:MM or YYYY-MM-DD HH:MM) as Algeria local
+ *  time and return the UTC epoch ms. Returns null when unparseable. */
+export function dzWallClockToEpoch(input: string): number | null {
+  const m = String(input || '').trim().match(/^(\d{4}-\d{2}-\d{2})?[T ]?(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const [, datePart, hh, mm] = m;
+  let y: number, mo: number, d: number;
+  if (datePart) {
+    [y, mo, d] = datePart.split('-').map(Number);
+  } else {
+    const w = new Date(Date.now() + DZ_OFFSET_MIN * 60_000);
+    y = w.getUTCFullYear(); mo = w.getUTCMonth() + 1; d = w.getUTCDate();
   }
+  const utcMs = Date.UTC(y, mo - 1, d, Number(hh), Number(mm)) - DZ_OFFSET_MIN * 60_000;
+  // If a bare time already passed today (Algeria), the owner means tomorrow.
+  if (!datePart && utcMs <= Date.now() + 60_000) return utcMs + 24 * 3600_000;
+  return utcMs;
 }
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+export function epochToWall(epochMs: number): string {
+  const w = new Date(epochMs + DZ_OFFSET_MIN * 60_000);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${w.getUTCFullYear()}-${pad(w.getUTCMonth() + 1)}-${pad(w.getUTCDate())} ${pad(w.getUTCHours())}:${pad(w.getUTCMinutes())}`;
+}
+
+export function nextId(prefix: string): string {
+  return `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+export function dayKey(ms = Date.now()): string {
+  // Algeria-local day key for counter resets
+  const w = new Date(ms + DZ_OFFSET_MIN * 60_000);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${w.getUTCFullYear()}-${pad(w.getUTCMonth() + 1)}-${pad(w.getUTCDate())}`;
 }

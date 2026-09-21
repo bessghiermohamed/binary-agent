@@ -1,8 +1,30 @@
 {
   "name": "binary-agent",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "scripts": { "dev": "next dev", "build": "next build", "start": "next start", "typecheck": "tsc --noEmit" },
-  "dependencies": { "next": "^16.1.1", "pg": "^8.16.3", "react": "^19.0.0", "react-dom": "^19.0.0" },
-  "devDependencies": { "@types/node": "^22", "@types/pg": "^8.11.11", "@types/react": "^19", "@types/react-dom": "^19", "typescript": "5" }
+  "description": "بيناري — autonomous Arabic-speaking Telegram agent: hedged multi-provider LLM cortex, GitHub mind + Supabase pgvector recall, one repo, free stack.",
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "lucide-react": "^0.525.0",
+    "next": "^16.1.1",
+    "pg": "^8.6.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.13",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "tailwindcss": "^4.1.13",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
 }

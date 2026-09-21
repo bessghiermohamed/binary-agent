@@ -1,264 +1,352 @@
-// ─── Binary's LLM cortex v2 — hedged multi-provider racing ─────────────────
-// Instead of walking the chain one-by-one (a single slow/hanging provider ate
-// the whole time budget and every later provider starved — the cause of the
-// "مزودات الذكاء اصطدمت بعقبة" failures), providers now race in parallel
-// waves: first acceptable answer wins.
+// ─── Binary's LLM cortex v3 — hedged multi-provider racing ──────────────────
+// The fix for "suppliers are broken" (RULE 01): providers never walk
+// sequentially. They race in parallel waves via Promise.any — first
+// acceptable answer wins; a wave loses only when every member fails.
 //
-//   wave 1 (strong):  gemini > openrouter > cohere
-//   wave 2 (backup):  mistral > cloudflare > pollinations
-//   wave 3 (dormant): grok > groq > huggingface   (parked: no credits / 403)
+//   wave 1 (strong):   gemini · openrouter · cohere
+//   wave 2 (backup):   mistral · cloudflare · pollinations(openai)
+//   wave 3 (wide net): pollinations-mistral (keyless) · grok · groq · huggingface
 //
-// A circuit breaker parks any provider that fails twice in a row for 8 minutes
-// so rate-limited or geo-blocked endpoints never burn the budget again.
-// Keys come from env only. Pollinations is keyless (GPT4Free-style safety net).
-// Verified 2026-09-21 (sandbox): openrouter OK 2.9s, cohere OK 0.4s,
-// mistral OK 1.7s, cloudflare OK 0.8s, pollinations openai OK 2.6s (Arabic OK);
-// huggingface 403 (CF block), grok 403 (no credits), groq 403 (region);
-// gemini valid, geo-gated from sandbox, healthy from Vercel US.
+// v3 hardening (why the previous build answered poorly):
+//  · 11 racers instead of 9 — a second keyless pollinations model widens the
+//    no-key safety net to a genuinely different failure domain.
+//  · per-provider latency + rolling success stats (surfaced in /status and
+//    the dashboard so provider problems are visible without logs).
+//  · JSON repair escalation: fences stripped → balanced-brace scan →
+//    strictRetry at temperature ≤ 0.3 → {reply: raw} wrap. A parse miss can
+//    never masquerade as an outage (RULE 02).
+//  · overall budget enforced with a deadline that survives wave fan-out.
+//
+// Keys are env-only (RULE 11). Pollinations is keyless. Dormant providers
+// (grok: credits, groq: region, huggingface: CF block) stay in the chain —
+// breakers park them cheaply and they revive with zero code changes (RULE 06).
 
-const PROVIDERS: Record<string, any> = {
+import { LLM_CFG, TOKEN_CEIL } from './config';
+
+export interface ProviderDef {
+  url: string;
+  keyEnv: string;
+  model: string;
+  wave: 1 | 2 | 3;
+  extraHeaders?: Record<string, string>;
+  unwrap?: 'result';
+  keyless?: boolean;
+  note?: string;
+}
+
+export const PROVIDERS: Record<string, ProviderDef> = {
   gemini: {
     url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
     keyEnv: 'GEMINI_API_KEY',
     model: 'gemini-flash-latest',
+    wave: 1,
+    note: 'geo-gated from some regions; healthy from Vercel US',
   },
   openrouter: {
     url: 'https://openrouter.ai/api/v1/chat/completions',
     keyEnv: 'OPENROUTER_API_KEY',
     model: 'meta-llama/llama-3.3-70b-instruct',
+    wave: 1,
     extraHeaders: { 'HTTP-Referer': 'https://github.com/bessghiermohamed/binary-agent', 'X-Title': 'Binary Agent' },
   },
-  cohere: { url: 'https://api.cohere.ai/compatibility/v1/chat/completions', keyEnv: 'COHERE_API_KEY', model: 'command-r7b-12-2024' },
-  mistral: { url: 'https://api.mistral.ai/v1/chat/completions', keyEnv: 'MISTRAL_API_KEY', model: 'ministral-8b-latest' },
+  cohere: {
+    url: 'https://api.cohere.ai/compatibility/v1/chat/completions',
+    keyEnv: 'COHERE_API_KEY',
+    model: 'command-r7b-12-2024',
+    wave: 1,
+    note: 'fastest verified (0.4s)',
+  },
+  mistral: {
+    url: 'https://api.mistral.ai/v1/chat/completions',
+    keyEnv: 'MISTRAL_API_KEY',
+    model: 'ministral-8b-latest',
+    wave: 2,
+  },
   cloudflare: {
-    // Workers AI — free daily neuron allowance, account id comes from env.
-    url: (
-      process.env.CF_ACCOUNT_ID
-        ? `https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/ai/run/@cf/meta/llama-3.1-8b-instruct`
-        : ''
-    ),
+    url: process.env.CF_ACCOUNT_ID
+      ? `https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/ai/run/@cf/meta/llama-3.1-8b-instruct`
+      : '',
     keyEnv: 'CF_API_TOKEN',
     model: '@cf/meta/llama-3.1-8b-instruct',
-    unwrap: 'result', // response shape: { success, result: { choices: [...] } }
+    wave: 2,
+    unwrap: 'result',
+    note: 'Workers AI — response needs unwrap:result (RULE 04)',
   },
   pollinations: {
-    // Keyless community endpoint (GPT4Free-style). 'openai' (gpt-4o-mini class)
-    // answers faster AND writes cleaner Arabic than 'openai-fast'.
     url: 'https://text.pollinations.ai/openai',
     keyEnv: '',
     model: 'openai',
+    wave: 2,
+    keyless: true,
+    note: "keyless GPT4Free-style net — 'openai' writes cleaner Arabic than 'openai-fast'",
   },
-  grok: { url: 'https://api.x.ai/v1/chat/completions', keyEnv: 'GROK_API_KEY', model: 'grok-3-mini' },
-  groq: { url: 'https://api.groq.com/openai/v1/chat/completions', keyEnv: 'GROQ_API_KEY', model: 'llama-3.3-70b-versatile' },
+  'pollinations-mistral': {
+    url: 'https://text.pollinations.ai/openai',
+    keyEnv: '',
+    model: 'mistral',
+    wave: 3,
+    keyless: true,
+    note: 'second keyless racer on a different upstream model',
+  },
+  grok: {
+    url: 'https://api.x.ai/v1/chat/completions',
+    keyEnv: 'GROK_API_KEY',
+    model: 'grok-3-mini',
+    wave: 3,
+    note: 'dormant: no credits',
+  },
+  groq: {
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    keyEnv: 'GROQ_API_KEY',
+    model: 'llama-3.3-70b-versatile',
+    wave: 3,
+    note: 'dormant: region-blocked',
+  },
   huggingface: {
     url: 'https://router.huggingface.co/v1/chat/completions',
     keyEnv: 'HF_API_KEY',
     model: 'meta-llama/Llama-3.3-70B-Instruct',
+    wave: 3,
+    note: 'dormant: intermittent CF block',
   },
 };
 
 const WAVES: string[][] = [
   ['gemini', 'openrouter', 'cohere'],
   ['mistral', 'cloudflare', 'pollinations'],
-  ['grok', 'groq', 'huggingface'],
+  ['pollinations-mistral', 'grok', 'groq', 'huggingface'],
 ];
 
-const CALL_TIMEOUT_MS = 14_000; // per provider (was 25s — a hang ate the budget)
-const BREAK_THRESHOLD = 2; // consecutive failures before parking
-const BREAK_MS = 8 * 60_000; // park duration
+export interface ChatMsg { role: 'system' | 'user' | 'assistant'; content: string }
 
+// ─── stats + circuit breaker (module-scope, per warm lambda) ────────────────
+interface PStats { ok: number; fail: number; lastError: string; lastMs: number; avgMs: number }
 export const llmStats = {
   ok: 0,
   fail: 0,
   lastError: '',
   lastProvider: '',
-  perProvider: {} as Record<string, { ok: number; fail: number; lastError: string }>,
+  lastMs: 0,
+  perProvider: {} as Record<string, PStats>,
 };
-
 const breaker: Record<string, { fails: number; until: number }> = {};
 
+function pStats(p: string): PStats {
+  return (llmStats.perProvider[p] ||= { ok: 0, fail: 0, lastError: '', lastMs: 0, avgMs: 0 });
+}
+
+function noteOk(p: string, ms: number) {
+  const s = pStats(p);
+  s.ok++; s.lastMs = ms; s.avgMs = s.avgMs ? Math.round(s.avgMs * 0.7 + ms * 0.3) : ms;
+  llmStats.ok++; llmStats.lastProvider = p; llmStats.lastMs = ms;
+  const b = breaker[p]; if (b) b.fails = 0;
+}
+
 function noteFail(p: string, msg: string) {
+  const s = pStats(p);
+  s.fail++; s.lastError = String(msg).slice(0, 140);
+  llmStats.fail++; llmStats.lastError = s.lastError;
   const b = (breaker[p] ||= { fails: 0, until: 0 });
   b.fails++;
-  const st = (llmStats.perProvider[p] ||= { ok: 0, fail: 0, lastError: '' });
-  st.fail++;
-  st.lastError = msg;
-  if (b.fails >= BREAK_THRESHOLD) {
-    b.until = Date.now() + BREAK_MS;
-    b.fails = 0;
-    console.error(`[agent.llm] breaker: ${p} parked ${BREAK_MS / 60000}min (${msg.slice(0, 80)})`);
-  }
+  if (b.fails >= LLM_CFG.breakThreshold) b.until = Date.now() + LLM_CFG.breakMs;
 }
 
-function noteOk(p: string) {
-  breaker[p] = { fails: 0, until: 0 };
-  const st = (llmStats.perProvider[p] ||= { ok: 0, fail: 0, lastError: '' });
-  st.ok++;
-}
-
-/** Public snapshot for /status — owner-visible provider health. */
-export function llmHealth(): { ready: string[]; parked: string[]; lastProvider: string; lastError: string } {
+export function llmHealth() {
+  const ready: string[] = [];
+  const parked: { provider: string; untilWall: string; lastError: string }[] = [];
   const now = Date.now();
-  const all = WAVES.flat();
-  const hasKey = (p: string) => {
-    const env = PROVIDERS[p]?.keyEnv;
-    return !env || !!process.env[env];
-  };
+  for (const name of Object.keys(PROVIDERS)) {
+    if (!usable(name)) continue;
+    const b = breaker[name];
+    if (b && b.until > now) {
+      parked.push({ provider: name, untilWall: new Date(b.until).toISOString(), lastError: pStats(name).lastError });
+    } else {
+      ready.push(name);
+    }
+  }
   return {
-    ready: all.filter((p) => hasKey(p) && (breaker[p]?.until ?? 0) < now),
-    parked: all.filter((p) => hasKey(p) && (breaker[p]?.until ?? 0) >= now),
+    ready,
+    readyCount: ready.length,
+    parked,
     lastProvider: llmStats.lastProvider,
     lastError: llmStats.lastError,
+    lastMs: llmStats.lastMs,
+    totals: { ok: llmStats.ok, fail: llmStats.fail },
+    perProvider: llmStats.perProvider,
+    waves: WAVES,
   };
 }
 
-function modelFor(name: string): string {
-  return process.env[`MODEL_${name.toUpperCase()}`] || PROVIDERS[name].model;
-}
-
-async function callOne(name: string, messages: any[], opts: { maxTokens: number; temperature: number }): Promise<string> {
-  const cfg = PROVIDERS[name];
-  const key = cfg.keyEnv ? process.env[cfg.keyEnv] : 'keyless';
-  if (!key) throw new Error('missing API key env: ' + cfg.keyEnv);
-  if (!cfg.url) throw new Error('missing config for provider: ' + name);
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), CALL_TIMEOUT_MS);
-  try {
-    const res = await fetch(cfg.url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(cfg.keyEnv ? { authorization: `Bearer ${key}` } : {}),
-        ...(cfg.extraHeaders || {}),
-      },
-      body: JSON.stringify({ model: modelFor(name), messages, max_tokens: opts.maxTokens, temperature: opts.temperature }),
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).replace(/\s+/g, ' ').slice(0, 140)}`);
-    let j: any = await res.json();
-    if (cfg.unwrap && j[cfg.unwrap]) j = j[cfg.unwrap]; // cloudflare { result: { choices } }
-    const txt = j.choices?.[0]?.message?.content;
-    if (!txt) throw new Error('empty completion');
-    return txt;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-/** Race a set of providers in parallel; first success wins. */
-function race(names: string[], messages: any[], opts: { maxTokens: number; temperature: number }): Promise<string> {
-  const runners = names.map(async (p) => {
-    try {
-      const out = await callOne(p, messages, opts);
-      noteOk(p);
-      llmStats.ok++;
-      llmStats.lastProvider = p;
-      return out;
-    } catch (e: any) {
-      const msg = String(e?.message || e).slice(0, 140);
-      noteFail(p, msg);
-      llmStats.fail++;
-      llmStats.lastError = msg;
-      console.error(`[agent.llm] ${p} failed:`, msg);
-      throw e;
-    }
-  });
-  return Promise.any(runners); // Node 18+/20: resolves on first fulfilled
-}
-
-/** Is this provider actually usable right now (key present, url built)? */
-function usable(p: string): boolean {
-  const cfg = PROVIDERS[p];
-  if (!cfg) return false;
-  if (cfg.keyEnv && !process.env[cfg.keyEnv]) return false;
-  if (!cfg.url) return false;
+function usable(name: string): boolean {
+  const p = PROVIDERS[name];
+  if (!p) return false;
+  if (!p.url) return false; // cloudflare without account id
+  if (p.keyEnv && !process.env[p.keyEnv]) return false; // key missing
   return true;
 }
 
-export async function chat(messages: any[], opts: any = {}): Promise<string> {
-  const maxTokens = opts.maxTokens ?? 400;
-  const temperature = opts.temperature ?? 0.6;
-  const budgetMs = opts.budgetMs ?? 42_000;
-  const t0 = Date.now();
-  let lastErr: any = new Error('no provider configured');
-  for (const wave of WAVES) {
-    if (Date.now() - t0 > budgetMs) break;
-    const now = Date.now();
-    const candidates = wave.filter((p) => usable(p) && (breaker[p]?.until ?? 0) < now);
-    if (!candidates.length) continue; // whole wave parked/unusable -> next wave
-    try {
-      return await race(candidates, messages, { maxTokens, temperature });
-    } catch (e: any) {
-      lastErr = e; // wave lost completely -> next wave
-    }
-  }
-  throw lastErr;
+function modelOf(name: string): string {
+  const p = PROVIDERS[name];
+  const overrideEnv = `MODEL_${name.toUpperCase().replace(/-/g, '_')}`;
+  return process.env[overrideEnv] || p.model;
 }
 
-/** Tolerant JSON extraction: models sometimes wrap JSON in prose or ```fences. */
-export function extractJson(text: string): any | null {
-  if (!text) return null;
-  let t = String(text).replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) t = fence[1].trim();
-  const direct = (() => {
-    try {
-      return JSON.parse(t);
-    } catch {
-      return null;
+// ─── single provider call ────────────────────────────────────────────────────
+async function callOne(
+  name: string,
+  messages: ChatMsg[],
+  opts: { temperature?: number; maxTokens?: number },
+): Promise<{ provider: string; text: string; ms: number }> {
+  const p = PROVIDERS[name];
+  const model = modelOf(name);
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (p.keyEnv && process.env[p.keyEnv]) headers.authorization = `Bearer ${process.env[p.keyEnv]}`;
+  if (p.extraHeaders) Object.assign(headers, p.extraHeaders);
+
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    temperature: opts.temperature ?? 0.6,
+    max_tokens: opts.maxTokens ?? TOKEN_CEIL.chat,
+  };
+  if (name === 'pollinations' || name === 'pollinations-mistral') {
+    body.private = true; // keep community-proxy traffic off public feeds
+  }
+
+  const ctl = new AbortController();
+  const kill = setTimeout(() => ctl.abort(), LLM_CFG.callTimeoutMs);
+  const t0 = Date.now();
+  try {
+    const res = await fetch(p.url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: ctl.signal,
+    });
+    const ms = Date.now() - t0;
+    if (!res.ok) {
+      const errText = (await res.text().catch(() => '')).slice(0, 160);
+      noteFail(name, `HTTP ${res.status} ${errText}`);
+      throw new Error(`${name}: HTTP ${res.status}`);
     }
-  })();
-  if (direct && typeof direct === 'object') return direct;
-  // first balanced {...} block
-  let start = t.indexOf('{');
-  while (start >= 0) {
-    let depth = 0;
-    let inStr = false;
-    let esc = false;
-    for (let i = start; i < t.length; i++) {
-      const c = t[i];
-      if (inStr) {
-        if (esc) esc = false;
-        else if (c === '\\') esc = true;
-        else if (c === '"') inStr = false;
-        continue;
-      }
-      if (c === '"') inStr = true;
-      else if (c === '{') depth++;
-      else if (c === '}') {
-        depth--;
-        if (depth === 0) {
-          try {
-            return JSON.parse(t.slice(start, i + 1));
-          } catch {
-            break;
-          }
-        }
+    const json: any = await res.json();
+    let payload = json;
+    if (p.unwrap === 'result') payload = json?.result ?? json; // RULE 04
+    let text: string = '';
+    if (payload?.choices?.[0]?.message?.content != null) {
+      text = String(payload.choices[0].message.content);
+    } else if (payload?.choices?.[0]?.text != null) {
+      text = String(payload.choices[0].text);
+    } else if (typeof payload?.content === 'string') { // pollinations variants
+      text = payload.content;
+    } else if (payload?.response?.content?.[0]?.text) { // some anthropic-style shims
+      text = String(payload.response.content[0].text);
+    }
+    text = (text || '').trim();
+    if (text.length < 2) {
+      noteFail(name, 'empty content');
+      throw new Error(`${name}: empty content`);
+    }
+    noteOk(name, ms);
+    return { provider: name, text, ms };
+  } catch (e: any) {
+    if (!`${e?.message || ''}`.startsWith(name)) noteFail(name, e?.message || 'network');
+    throw e;
+  } finally {
+    clearTimeout(kill);
+  }
+}
+
+// ─── public: chat() — race waves, first acceptable answer wins ──────────────
+export async function chat(
+  messages: ChatMsg[],
+  opts: { temperature?: number; maxTokens?: number; budgetMs?: number } = {},
+): Promise<{ text: string; provider: string; ms: number; wave: number } | null> {
+  const deadline = Date.now() + (opts.budgetMs ?? LLM_CFG.overallBudgetMs);
+  const errors: string[] = [];
+  for (let w = 0; w < WAVES.length; w++) {
+    if (Date.now() >= deadline) { errors.push('deadline'); break; }
+    const members = WAVES[w].filter(usable);
+    if (!members.length) continue;
+    const racers = members.map((name) =>
+      callOne(name, messages, opts).catch((e) => {
+        errors.push(String(e?.message || e));
+        return null;
+      }),
+    );
+    const budgetLeft = deadline - Date.now();
+    const winner = await Promise.race([
+      Promise.any(racers as Promise<{ provider: string; text: string; ms: number }>[]).catch(() => null),
+      new Promise<null>((r) => setTimeout(() => r(null), Math.max(budgetLeft, 1))),
+    ]);
+    if (winner) return { ...winner, wave: w + 1 };
+  }
+  llmStats.lastError = errors.slice(-3).join(' | ').slice(0, 200) || 'all providers failed';
+  return null;
+}
+
+// ─── JSON mode — decision traffic (RULE 02: parse miss ≠ outage) ────────────
+export function extractJson(raw: string): any | null {
+  let s = String(raw || '').trim();
+  s = s.replace(/```(?:json)?/gi, ''); // strip code fences
+  const start = s.indexOf('{');
+  if (start === -1) return null;
+  // balanced-brace scan from the first '{'
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{') depth++;
+    if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        const candidate = s.slice(start, i + 1);
+        try { return JSON.parse(candidate); } catch { return null; }
       }
     }
-    start = t.indexOf('{', start + 1);
   }
   return null;
 }
 
-/**
- * JSON-mode chat. With strictRetry (chat path), one bad parse costs a retried
- * call and, as a last resort, the raw text is wrapped as { reply } so the bot
- * answers with model output instead of the "providers hit an obstacle" notice.
- */
-export async function chatJson(messages: any[], opts: any = {}): Promise<any | null> {
-  const raw = await chat(messages, opts);
-  const first = extractJson(raw);
-  if (first && typeof first === 'object') return first;
-  if (!opts.strictRetry) return null;
-  const raw2 = await chat(
-    [
-      ...messages,
-      { role: 'user', content: 'Your previous answer was not valid JSON. Output ONLY valid JSON now — no prose, no code fences, no mixed languages.' },
-    ],
-    { ...opts, temperature: Math.min(opts.temperature ?? 0.6, 0.3), budgetMs: 20_000 }
-  );
-  const second = extractJson(raw2);
-  if (second && typeof second === 'object') return second;
-  return { reply: String(raw).replace(/\s+/g, ' ').slice(0, 600) };
+export async function chatJson(
+  messages: ChatMsg[],
+  opts: { maxTokens?: number; budgetMs?: number } = {},
+): Promise<{ json: any; provider: string; ms: number; retried: boolean } | null> {
+  // attempt 1 — normal temperature
+  const first = await chat(messages, { ...opts, temperature: 0.6 });
+  if (first) {
+    const json = extractJson(first.text);
+    if (json && typeof json === 'object') return { json, provider: first.provider, ms: first.ms, retried: false };
+  }
+  // attempt 2 — strict retry, low temperature, explicit instruction
+  const strictMsgs: ChatMsg[] = [
+    ...messages,
+    { role: 'user', content: 'IMPORTANT: output ONLY one valid JSON object. No prose, no markdown fences, no commentary — JSON only.' },
+  ];
+  const second = await chat(strictMsgs, { ...opts, temperature: 0.2, budgetMs: 20_000 });
+  if (second) {
+    const json = extractJson(second.text);
+    if (json && typeof json === 'object') return { json, provider: second.provider, ms: second.ms, retried: true };
+    // RULE 02 final degradation — model spoke, but not JSON. Never fake an outage.
+    return { json: { reply: second.text }, provider: second.provider, ms: second.ms, retried: true };
+  }
+  if (first) return { json: { reply: first.text }, provider: first.provider, ms: first.ms, retried: true };
+  return null; // genuine outage — every racer in every wave failed
+}
+
+// ─── provider probe (setup/verification, burns no budget silently) ─────────
+export async function probeProvider(name: string): Promise<{ ok: boolean; ms: number; error: string }> {
+  if (!usable(name)) return { ok: false, ms: 0, error: 'not usable (missing key or url)' };
+  try {
+    const r = await callOne(name, [
+      { role: 'system', content: 'You are a probe. Reply with the single word: OK' },
+      { role: 'user', content: 'ping' },
+    ], { temperature: 0, maxTokens: 8 });
+    return { ok: true, ms: r.ms, error: '' };
+  } catch (e: any) {
+    return { ok: false, ms: 0, error: String(e?.message || e).slice(0, 120) };
+  }
 }

@@ -1,140 +1,120 @@
-// ─── GitHub = the agent's database, notebook and workshop ────────────────────
-// Thin Contents API client with optimistic concurrency. Every write needs the
-// current file `sha`, so concurrent writers get 409/422 — we retry once with a
-// fresh GET. This also powers the distributed tick lock (see memory.ts).
+// ─── GitHub Contents API + workflow dispatch ────────────────────────────────
+// GitHub is the canonical durable mind (spec §7): plain files, optimistic
+// concurrency via sha (which doubles as the distributed tick lock), and the
+// workflow_dispatch call that powers fast-follow chains.
+
+import { SECRETS } from './config';
 
 const API = 'https://api.github.com';
 
-function headers(token: string): Record<string, string> {
-  return {
-    accept: 'application/vnd.github+json',
-    authorization: `Bearer ${token}`,
-    'content-type': 'application/json',
-    'user-agent': 'murad-agent',
-  };
+function gh(path: string, init?: RequestInit): Promise<any> {
+  return fetch(`${API}${path}`, {
+    ...init,
+    headers: {
+      authorization: `Bearer ${SECRETS.ghToken}`,
+      accept: 'application/vnd.github+json',
+      'content-type': 'application/json',
+      'user-agent': 'binary-agent/2',
+      ...(init?.headers || {}),
+    },
+  }).then(async (r) => {
+    if (!r.ok) {
+      const body = (await r.text().catch(() => '')).slice(0, 200);
+      throw new Error(`github ${path.split('?')[0]}: HTTP ${r.status} ${body}`);
+    }
+    return r.status === 204 ? null : r.json();
+  });
 }
 
-export async function gh(
-  token: string,
-  path: string,
-  init: any = {},
-  timeoutMs = 15000
-): Promise<{ status: number; json: any }> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+export async function readFile(repo: string, path: string): Promise<{ content: string; sha: string } | null> {
   try {
-    const res = await fetch(path.startsWith('http') ? path : API + path, {
-      ...init,
-      headers: { ...headers(token), ...(init.headers || {}) },
-      signal: ctrl.signal,
-    });
-    const json = await res.json().catch(() => ({}));
-    return { status: res.status, json };
-  } finally {
-    clearTimeout(t);
+    const meta = await gh(`/repos/${repo}/contents/${encodePath(path)}`);
+    if (meta?.encoding !== 'base64' || meta?.content == null) return null;
+    const content = Buffer.from(meta.content, 'base64').toString('utf8');
+    return { content, sha: meta.sha };
+  } catch (e: any) {
+    if (String(e?.message || '').includes('HTTP 404')) return null;
+    throw e;
   }
 }
 
-// ─── single file read/write on the memory repo ───────────────────────────────
-
-export interface RawFile {
-  sha: string | null;
-  content: string;
-  exists: boolean;
-}
-
-export async function readFile(
-  token: string,
-  repo: string,
-  path: string,
-  ref = 'main'
-): Promise<RawFile> {
-  const { status, json } = await gh(
-    token,
-    `/repos/${repo}/contents/${encodeURIComponent(path).replace(/%2F/g, '/')}?ref=${ref}`
-  );
-  if (status === 404) return { sha: null, content: '', exists: false };
-  if (status !== 200 || !json?.content) return { sha: null, content: '', exists: false };
-  const content = Buffer.from(json.content, 'base64').toString('utf8');
-  return { sha: json.sha, content, exists: true };
-}
-
-/** Write (or create) one file. Retries once on sha conflict. */
 export async function writeFile(
-  token: string,
   repo: string,
   path: string,
   content: string,
   message: string,
-  opts: { sha?: string | null; branch?: string; tries?: number } = {}
-): Promise<{ ok: boolean; sha: string | null; error?: string }> {
-  const branch = opts.branch || 'main';
-  let sha = opts.sha;
-  for (let i = 0; i < (opts.tries ?? 2); i++) {
-    if (sha === undefined) {
-      const cur = await readFile(token, repo, path, branch);
-      sha = cur.sha;
-    }
-    const body: any = { message, content: Buffer.from(content, 'utf8').toString('base64'), branch };
-    if (sha) body.sha = sha;
-    const { status, json } = await gh(token, `/repos/${repo}/contents/${encodeURIComponent(path).replace(/%2F/g, '/')}`, {
+  sha?: string | null,
+): Promise<{ ok: boolean; sha?: string; error?: string }> {
+  try {
+    const res = await gh(`/repos/${repo}/contents/${encodePath(path)}`, {
       method: 'PUT',
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        message,
+        content: Buffer.from(content, 'utf8').toString('base64'),
+        ...(sha ? { sha } : {}),
+      }),
     });
-    if (status === 200 || status === 201) return { ok: true, sha: json?.content?.sha || null };
-    // sha conflict or race -> refresh and retry once
-    const cur = await readFile(token, repo, path, branch);
-    if (cur.sha) {
-      sha = cur.sha;
+    return { ok: true, sha: res?.content?.sha };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e).slice(0, 200) };
+  }
+}
+
+/** Read-modify-write with optimistic concurrency + retry on CAS conflict. */
+export async function rmwFile(
+  repo: string,
+  path: string,
+  message: string,
+  mutate: (current: string | null) => string | null,
+  attempts = 3,
+): Promise<{ ok: boolean; error?: string }> {
+  for (let i = 0; i < attempts; i++) {
+    const cur = await readFile(repo, path);
+    const next = mutate(cur ? cur.content : null);
+    if (next === null) return { ok: true }; // no change requested
+    if (next === cur?.content) return { ok: true }; // unchanged
+    const w = await writeFile(repo, path, next, message, cur?.sha);
+    if (w.ok) return { ok: true };
+    if (String(w.error || '').includes('HTTP 409') || String(w.error || '').includes('conflict')) {
+      await new Promise((r) => setTimeout(r, 400 + Math.random() * 400)); // jitter
       continue;
     }
-    return { ok: false, sha: null, error: `github PUT ${path} -> ${status} ${JSON.stringify(json).slice(0, 160)}` };
+    return { ok: false, error: w.error };
   }
-  return { ok: false, sha: null, error: `github PUT ${path} -> sha conflict` };
+  return { ok: false, error: 'cas-conflict (3 attempts)' };
 }
 
-// ─── workflow dispatch (fast-follow ticks), gists, issues ────────────────────
+export async function appendJsonl(
+  repo: string,
+  path: string,
+  line: Record<string, unknown>,
+  message: string,
+  cap?: number,
+): Promise<{ ok: boolean; error?: string }> {
+  return rmwFile(repo, path, message, (cur) => {
+    const lines = (cur || '').split('\n').filter(Boolean);
+    lines.push(JSON.stringify(line));
+    const trimmed = cap && lines.length > cap ? lines.slice(-cap) : lines;
+    return trimmed.join('\n') + '\n';
+  });
+}
 
 export async function dispatchWorkflow(
-  token: string,
   repo: string,
-  workflowFile: string,
+  workflowFileName: string,
   inputs: Record<string, string> = {},
-  ref = 'main'
 ): Promise<{ ok: boolean; error?: string }> {
-  const { status } = await gh(token, `/repos/${repo}/actions/workflows/${workflowFile}/dispatches`, {
-    method: 'POST',
-    body: JSON.stringify({ ref, inputs }),
-  });
-  // 204 = accepted; 404 may mean the workflow file doesn't exist yet
-  if (status === 204 || status === 200) return { ok: true };
-  return { ok: false, error: `dispatch -> ${status}` };
+  try {
+    await gh(`/repos/${repo}/actions/workflows/${workflowFileName}/dispatches`, {
+      method: 'POST',
+      body: JSON.stringify({ ref: 'main', inputs }),
+    });
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e).slice(0, 160) };
+  }
 }
 
-export async function createGist(
-  token: string,
-  files: Record<string, string>,
-  description: string,
-  isPublic = false
-): Promise<{ ok: boolean; url?: string; error?: string }> {
-  const { status, json } = await gh(token, '/gists', {
-    method: 'POST',
-    body: JSON.stringify({ files, description: description.slice(0, 300), public: isPublic }),
-  });
-  if (status === 201) return { ok: true, url: json?.html_url };
-  return { ok: false, error: `gist -> ${status}` };
-}
-
-export async function createIssue(
-  token: string,
-  repo: string,
-  title: string,
-  body: string
-): Promise<{ ok: boolean; url?: string; error?: string }> {
-  const { status, json } = await gh(token, `/repos/${repo}/issues`, {
-    method: 'POST',
-    body: JSON.stringify({ title: title.slice(0, 200), body: body.slice(0, 6000) }),
-  });
-  if (status === 201) return { ok: true, url: json?.html_url };
-  return { ok: false, error: `issue -> ${status}` };
+function encodePath(p: string): string {
+  return p.split('/').map(encodeURIComponent).join('/');
 }
