@@ -77,14 +77,31 @@ const POOLER_REGIONS = [
   'eu-central-1',
   'eu-west-1',
   'eu-west-2',
+  'eu-west-3',
+  'eu-central-2',
   'eu-north-1',
+  'eu-south-1',
+  'eu-south-2',
   'us-east-1',
+  'us-east-2',
   'us-west-1',
-  'ap-southeast-1',
-  'ap-northeast-1',
-  'ap-south-1',
+  'us-west-2',
+  'ca-central-1',
   'sa-east-1',
+  'me-south-1',
+  'me-central-1',
+  'ap-southeast-1',
+  'ap-southeast-2',
+  'ap-northeast-1',
+  'ap-northeast-2',
+  'ap-northeast-3',
+  'ap-south-1',
+  'ap-south-2',
+  'ap-east-1',
+  'af-south-1',
 ];
+
+const POOLER_CLUSTERS = ['aws-1', 'aws-0']; // new projects live on aws-1
 
 function supabaseRef(): string {
   const url = process.env.SUPABASE_URL || '';
@@ -120,12 +137,14 @@ async function probe(): Promise<{ host: string | null; urls: Record<string, stri
   if (process.env.DATABASE_URL) urls.database_url = process.env.DATABASE_URL;
   if (ref && pw) {
     urls[`direct`] = `postgresql://postgres:${encodeURIComponent(pw)}@db.${ref}.supabase.co:5432/postgres`;
-    for (const r of POOLER_REGIONS) {
-      urls[`pooler-${r}`] = `postgresql://postgres.${ref}:${encodeURIComponent(pw)}@aws-0-${r}.pooler.supabase.com:6543/postgres`;
+    for (const cluster of POOLER_CLUSTERS) {
+      for (const r of POOLER_REGIONS) {
+        urls[`${cluster}-${r}`] = `postgresql://postgres.${ref}:${encodeURIComponent(pw)}@${cluster}-${r}.pooler.supabase.com:6543/postgres`;
+      }
     }
   }
   for (const [name, u] of Object.entries(urls)) {
-    const r = await tryConnect(u, name.startsWith('pooler') ? 3500 : 6000);
+    const r = await tryConnect(u, name.startsWith('pooler') || name.startsWith('aws-') ? 3000 : 6000);
     attempts.push({ name, ok: r.ok, err: r.err });
     if (r.ok) return { host: name, urls, attempts };
   }
