@@ -10,9 +10,9 @@
 //   - /api/agent/tick    : GitHub Actions every 5 min + self-dispatched chains
 
 import { randomUUID } from 'node:crypto';
-import { AGENT, AGENT_CONFIG, nowParts, dayKey } from './config';
+import { AGENT, AGENT_CONFIG, nowParts, dayKey, localNow, TZ_LABEL } from './config';
 import { dispatchWorkflow } from './github';
-import { chatJson } from './llm';
+import { chatJson, llmHealth } from './llm';
 import {
   acquireLock,
   releaseLock,
@@ -577,13 +577,16 @@ export async function handleChatMessage(msg: any): Promise<any> {
       [
         {
           role: 'system',
-          content: `${b.identity || ''}${recallBlock}\n\nYou are ${AGENT.name} (${AGENT.nameAr}), an autonomous agent from ${AGENT.home}, chatting on Telegram with ${isOwner ? `your owner (${b.state.ownerName || 'them'})` : 'a person'}. Current date: ${nowParts().utc}. You are mid-life with these goals: ${goalsBlock(b) || 'none'}. Reply in Modern Standard Arabic (العربية الفصحى) — naturally and concisely (1-4 sentences, plain text, no headers, no dialect). If their message asks you to DO real work (research/find/build/monitor/track/write/fetch something), also create a goal so you can work on it between messages — reply briefly in Arabic that you're on it.\nOutput JSON only: {"reply":"...","newGoal":{"title":"...","description":"..."} | null}`,
+          content: `${b.identity || ''}${recallBlock}\n\nYou are ${AGENT.name} (${AGENT.nameAr}), an autonomous agent from ${AGENT.home}, chatting on Telegram with ${isOwner ? `your owner (${b.state.ownerName || 'them'})` : 'a person'}.\nCurrent local time at home: ${localNow()} (${TZ_LABEL}). UTC: ${nowParts().utc}.\nYou are mid-life with these goals: ${goalsBlock(b) || 'none'}.\n\nHard rules:\n1. Reply in clean Modern Standard Arabic (العربية الفصحى) — 1-4 sentences, plain text, no headers. NEVER mix any other language or script (English words, Chinese characters, etc.) into the Arabic. If the human writes in another language, mirror that language instead.\n2. If the message is a QUESTION (asking the time, your goals, your progress, what you can do, or anything informational), ANSWER it directly and truthfully from the facts above — it is NOT a new task. Never invent or re-register existing goals when merely asked about them.\n3. Only set newGoal when the human clearly asks you to DO real work (research/find/build/monitor/track/write/fetch something NEW). Small talk, statements, corrections and questions never create goals.\n4. If asked about the current time, use the current local time above exactly.\n\nOutput JSON only: {"reply":"...","newGoal":{"title":"...","description":"..."} | null}`,
         },
         { role: 'user', content: `Recent conversation:\n${conv.slice(-14).join('\n') || '(start)'}\n\nNew message from ${from.first_name || 'them'}: ${text.slice(0, 1200)}` },
       ],
-      { maxTokens: AGENT_CONFIG.CHAT_REPLY_MAX_TOKENS, temperature: 0.8 }
+      { maxTokens: AGENT_CONFIG.CHAT_REPLY_MAX_TOKENS, temperature: 0.6, strictRetry: true }
     );
-    const reply = j?.reply || (typeof j === 'string' ? j : null) || 'أنا هنا، لكن مزودات الذكاء اصطدمت بعقبة — حاول مجددًا بعد لحظات.';
+    const reply =
+      j?.reply ||
+      (typeof j === 'string' ? j : null) ||
+      'تعثّرت اتصالاتي بمزوّدي الذكاء لحظة — سأعيد المحاولة تلقائيًا، جرّب مرة أخرى بعد قليل.';
     await sendTelegram(chatId, String(reply).slice(0, 1500), { replyTo: isPrivate ? undefined : msg.message_id });
     await logConversation(chatId, AGENT.name, String(reply));
     await updateStateFields((s) => {
@@ -645,6 +648,7 @@ export async function handleCallback(cq: any): Promise<any> {
 
 function buildStatus(b: MemoryBundle): string {
   const up = Math.round((Date.now() - (b.state.totals.startedAt || Date.now())) / 86400_000);
+  const health = llmHealth();
   const lines = [
     `🧠 ${AGENT.nameAr} — حالة الوكيل`,
     `• الوضع: ${b.state.paused ? 'متوقف مؤقتًا' : 'ذاتي'} · عمر التشغيل ${up} يومًا`,
@@ -654,6 +658,7 @@ function buildStatus(b: MemoryBundle): string {
     `• آخر إجراء: ${b.state.lastAction ? `${b.state.lastAction.tool} (${b.state.lastAction.ok ? 'ناجح' : 'فاشل'}) — ${b.state.lastAction.summary}` : 'لا شيء بعد'}`,
     `• فحوص مجدولة: ${(b.state.scheduled || []).length} · موافقات معلّقة: ${b.approvals.filter((a) => a.status === 'pending').length}`,
     `• اليوم (توقيتي): ${dayKey()} · ${nowParts().alg}`,
+    `• مزوّدو الذكاء: جاهز ${health.ready.join('، ') || '—'}${health.parked.length ? ` · موقوف مؤقتًا ${health.parked.join('، ')}` : ''}${health.lastError ? ` · آخر خطأ: ${health.lastError.slice(0, 80)}` : ''}`,
   ];
   const active = b.goals.filter((g) => ['active', 'blocked', 'waiting_approval'].includes(g.status));
   if (active.length) lines.push('', 'الأهداف النشطة:', ...active.map((g) => `#${g.id} ${g.title} [${g.status}]`));

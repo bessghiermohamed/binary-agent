@@ -1,0 +1,53 @@
+name: Binary agent tick
+
+# The agent's heartbeat lives INSIDE the agent's own repo — one repo, no
+# separate scheduler repo. Every 5 minutes it wakes the agent on Vercel;
+# the agent can also self-dispatch this workflow (workflow_dispatch) for
+# fast-follow ticks while it works.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Who triggered this (cron | chain | manual)"
+        default: "manual"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: binary-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake the agent
+        env:
+          TICK_URL: ${{ secrets.AGENT_TICK_URL }}
+          SECRET: ${{ secrets.AGENT_TICK_SECRET }}
+          SRC: ${{ github.event.inputs.source || 'cron' }}
+        run: |
+          echo "tick source: $SRC"
+          curl -sS -m 90 -X POST "$TICK_URL" \
+            -H "x-agent-secret: $SECRET" \
+            -H "content-type: application/json" \
+            -d "{\"source\":\"$SRC\"}" || true
+
+      - name: Daily keepalive (prevents 60-day schedule auto-disable)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%H%M)" -lt "0010" ]; then
+            DATE=$(date -u +%Y-%m-%d)
+            TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            curl -sS -X PUT \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/contents/heartbeats/$DATE.txt" \
+              -d "{\"message\":\"keepalive $TS\",\"content\":\"$(echo -n $TS | base64 -w0)\"}" >/dev/null || true
+          fi

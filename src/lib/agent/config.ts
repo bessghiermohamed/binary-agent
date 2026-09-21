@@ -23,8 +23,10 @@ export const AGENT_CONFIG = {
   ghToken: process.env.AGENT_GH_TOKEN || '',
   // Guard for the tick endpoint (cron + scheduler hit it from outside)
   tickSecret: process.env.AGENT_TICK_SECRET || '',
-  // Scheduler repo (GitHub Actions heartbeat) used for chained ticks
-  schedulerRepo: process.env.AGENT_SCHEDULER_REPO || 'bessghiermohamed/binary-agent-loop',
+  // Scheduler: THIS repo carries its own heartbeat workflow
+  // (.github/workflows/agent-tick.yml) — one repo, no separate loop repo.
+  // Used for chained fast-follow ticks.
+  schedulerRepo: process.env.AGENT_SCHEDULER_REPO || 'bessghiermohamed/binary-agent',
   // Telegram webhook shared secret
   webhookSecret: process.env.AGENT_WEBHOOK_SECRET || '',
   // Owner: pinned automatically on first private DM unless preset here
@@ -58,6 +60,24 @@ export function nowParts(d = new Date()) {
 
 export function dayKey(d = new Date()): string {
   return new Date(d.getTime() + 60 * 60_000).toISOString().slice(0, 10); // owner-local day
+}
+
+/** Full local date/time at home (Africa/Algiers), e.g. "Sunday 21 September 2026 at 13:45". */
+export function localNow(d = new Date()): string {
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Africa/Algiers',
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(d);
+  } catch {
+    return nowParts().alg;
+  }
 }
 
 export function sleep(ms: number): Promise<void> {
