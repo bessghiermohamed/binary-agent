@@ -1,7 +1,11 @@
-// POST /api/agent/setup-db — one-click Supabase schema bootstrap (spec §4).
-// Idempotent DDL: enables pgvector, creates agent_episodes / agent_insights /
-// agent_messages with vector(1024) columns, HNSW indexes, and the
-// match_agent_* RPCs. Probes the pooler region matrix (aws-0 → aws-1).
+// POST /api/agent/setup-db — Supabase schema bootstrap / health check (spec §4).
+// Two layers:
+//  1. REST verification (always available): tables + RPCs via PostgREST.
+//  2. Direct Postgres DDL (best-effort): idempotent DDL through the pooler
+//     matrix when a pooler resolves — Supabase's pooler hostnames evolve,
+//     so the REST layer is the source of truth for "is the schema live".
+// The agent's runtime traffic (inserts + recall) is 100% PostgREST/HTTPS —
+// direct Postgres is only needed to CREATE schema that is missing.
 
 import { NextRequest, NextResponse } from 'next/server';
 import { SECRETS } from '@/lib/agent/config';
@@ -11,6 +15,8 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
 const REF = (process.env.SUPABASE_URL || '').replace(/^https:\/\//, '').split('.')[0];
+const SB_URL = process.env.SUPABASE_URL || '';
+const SB_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 
 const DDL = `
 create extension if not exists vector;
@@ -68,24 +74,53 @@ language sql stable as $$
 $$;
 `;
 
-export async function POST(req: NextRequest) {
-  const secret = req.headers.get('x-agent-secret') || req.nextUrl.searchParams.get('key') || '';
-  if (!SECRETS.tickSecret || secret !== SECRETS.tickSecret) {
-    return NextResponse.json({ ok: false, error: 'bad-secret' }, { status: 401 });
+async function restCheck() {
+  const tables: Record<string, string> = {};
+  let allOk = true;
+  for (const t of ['agent_episodes', 'agent_insights', 'agent_messages']) {
+    try {
+      const r = await fetch(`${SB_URL}/rest/v1/${t}?select=ts&limit=1`, {
+        headers: { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      tables[t] = r.ok ? 'ok' : `HTTP ${r.status}`;
+      if (!r.ok) allOk = false;
+    } catch (e: unknown) {
+      tables[t] = `unreachable: ${String((e as Error)?.message || e).slice(0, 60)}`;
+      allOk = false;
+    }
   }
-  const password = process.env.SUPABASE_DB_PASSWORD || '';
-  if (!REF || !password) {
-    return NextResponse.json({ ok: false, error: 'missing SUPABASE_URL or SUPABASE_DB_PASSWORD' });
+  // RPC probe — zero vector, match_count 0 (cheap, distinguishes missing fn)
+  let rpc = 'unknown';
+  try {
+    const r = await fetch(`${SB_URL}/rest/v1/rpc/match_agent_insights`, {
+      method: 'POST',
+      headers: { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ query_embedding: new Array(1024).fill(0), match_count: 0 }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    rpc = r.ok ? 'ok' : `HTTP ${r.status}`;
+    if (!r.ok) allOk = false;
+  } catch (e: unknown) {
+    rpc = `unreachable: ${String((e as Error)?.message || e).slice(0, 60)}`;
+    allOk = false;
   }
+  return { tables, rpc, allOk };
+}
 
+async function ddlAttempt() {
+  const password = process.env.SUPABASE_DB_PASSWORD || '';
+  if (!REF || !password) return { attempted: false, reason: 'missing SUPABASE_DB_PASSWORD', probes: {}, ddl: 'skipped' };
+  // Pooler matrix — Supabase pooler hostnames have changed across generations;
+  // probe several shapes + the (IPv6-capable) direct host.
   const hosts = [
     `aws-0-eu-west-2-pooler.supabase.com:6543`,
     `aws-1-eu-west-2-pooler.supabase.com:6543`,
+    `aws-0-eu-west-1-pooler.supabase.com:6543`,
+    `${REF}.pooler.supabase.com:6543`,
     `db.${REF}.supabase.co:5432`,
   ];
   const probes: Record<string, string> = {};
-  let ddlOutcome = 'no connection';
-
   const { Pool } = await import('pg');
   for (const host of hosts) {
     const cs = `postgresql://postgres.${REF}:${encodeURIComponent(password)}@${host}/postgres?sslmode=require&connect_timeout=6`;
@@ -96,21 +131,38 @@ export async function POST(req: NextRequest) {
         probes[host] = 'reachable';
         try {
           await pool.query(DDL);
-          ddlOutcome = 'ddl applied (idempotent)';
-        } catch (e: any) {
-          ddlOutcome = `ddl error: ${String(e?.message || e).slice(0, 200)}`;
+          pool.end().catch(() => null);
+          return { attempted: true, probes, ddl: 'ddl applied (idempotent)' };
+        } catch (e: unknown) {
+          probes[host] = `ddl error: ${String((e as Error)?.message || e).slice(0, 120)}`;
         }
-        pool.end().catch(() => null);
-        break;
       }
-    } catch (e: any) {
-      probes[host] = `unreachable: ${String(e?.message || e).slice(0, 80)}`;
+    } catch (e: unknown) {
+      probes[host] = `unreachable: ${String((e as Error)?.message || e).slice(0, 70)}`;
     } finally {
       pool.end().catch(() => null);
     }
   }
+  return { attempted: true, probes, ddl: 'no direct-Postgres route (pooler matrix exhausted — REST layer is authoritative)' };
+}
 
-  return NextResponse.json({ ok: ddlOutcome.startsWith('ddl applied'), ref: REF, probes, ddl: ddlOutcome });
+export async function POST(req: NextRequest) {
+  const secret = req.headers.get('x-agent-secret') || req.nextUrl.searchParams.get('key') || '';
+  if (!SECRETS.tickSecret || secret !== SECRETS.tickSecret) {
+    return NextResponse.json({ ok: false, error: 'bad-secret' }, { status: 401 });
+  }
+  if (!SB_URL || !SB_KEY) {
+    return NextResponse.json({ ok: false, error: 'missing SUPABASE_URL or SUPABASE_SERVICE_KEY' });
+  }
+  const rest = await restCheck();
+  const ddl = await ddlAttempt();
+  return NextResponse.json({
+    ok: rest.allOk,
+    ref: REF,
+    schema: rest.allOk ? 'verified via PostgREST (tables + RPC live)' : 'INCOMPLETE — run the DDL from the Supabase SQL editor',
+    rest,
+    directPostgres: ddl,
+  });
 }
 
 export async function GET(req: NextRequest) {
