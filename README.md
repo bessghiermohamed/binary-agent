@@ -1,4 +1,4 @@
-# Binary Agent (بيناري)
+# Binary Agent (بيناري) — dedicated deployment
 
 Standalone autonomous Telegram agent (Modern Standard Arabic). Independent of the Talib/Gu-mo app.
 
@@ -9,3 +9,5 @@ Standalone autonomous Telegram agent (Modern Standard Arabic). Independent of th
 
 Endpoints: `POST /api/agent/webhook` (Telegram, secret header), `POST /api/agent/tick` (`x-agent-secret`).
 See `.env.example` for all environment variables. No secrets are committed.
+
+- 2026-09-21: 9-provider chain (+keyless Pollinations), Supabase pgvector semantic memory, setup-db bootstrap
